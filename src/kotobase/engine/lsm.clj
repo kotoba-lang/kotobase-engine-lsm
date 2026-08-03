@@ -5,6 +5,7 @@
             [kotobase.engine.canonical :as canonical]
             [kotobase.engine.contract :as contract]
             [kotobase.engine.profile :as profile]
+            [merkle-lsm.compaction :as compaction]
             [merkle-lsm.core :as lsm]))
 
 (def engine-format-version 1)
@@ -43,16 +44,15 @@
         runs))
 
 (defn- compact-runs-if-needed
-  "Bound L0 fan-in without invalidating any historical snapshot. Safe epoch
-  zero deliberately retains every MVCC version; advancing it belongs to a
-  future reader-pin/retention policy, not to transaction execution."
-  [put! database-id target-run-rows threshold runs]
+  "Bound L0 fan-in while retaining every version required at SAFE-EPOCH."
+  [put! database-id safe-epoch target-run-rows threshold runs]
   (into {}
         (map (fn [[index values]]
                (if (< (count values) threshold)
                  [index values]
                  (let [compacted (lsm/compact-runs-partitioned
-                                  index database-id 0 target-run-rows values)]
+                                  index database-id safe-epoch
+                                  target-run-rows values)]
                    (doseq [run compacted]
                      (persist-effects! put! (:effects run)))
                    [index compacted]))))
@@ -63,6 +63,7 @@
    "format-version" engine-format-version
    "database-id" (:database-id state)
    "basis-t" (:basis-t state)
+   "safe-epoch" (:safe-epoch state 0)
    "lsm-manifest" (ipld/link lsm-root)
    "history-edn" (pr-str (:history state))
    "requests-edn" (pr-str (:requests state))
@@ -135,12 +136,24 @@
        (or (nil? pa) (= pa a))
        (or (nil? pv) (= pv v))))
 
+(defn- next-safe-epoch [reader-pins-fn state next-epoch]
+  (let [current (:safe-epoch state 0)
+        pins (vec (reader-pins-fn))
+        candidate (compaction/minimum-safe-epoch pins)]
+    (when-not (and (integer? candidate) (<= 0 candidate next-epoch))
+      (throw (ex-info "reader pins produced an invalid safe epoch"
+                      {:type :kotobase.engine/invalid-safe-epoch
+                       :safe-epoch candidate :next-epoch next-epoch
+                       :pins pins})))
+    (max current candidate)))
+
 (defrecord MerkleLsmEngine [put! get-fn digest-fn target-run-rows
-                            l0-compaction-threshold]
+                            l0-compaction-threshold reader-pins-fn]
   contract/IEngine
   (-engine-profile [_] lsm-profile)
   (-empty-state [_ {:keys [database-id]}]
-    {:database-id database-id :basis-t 0 :runs {} :run-refs {} :history []
+    {:database-id database-id :basis-t 0 :safe-epoch 0
+     :runs {} :run-refs {} :history []
      :requests {} :snapshots {}})
 
   (-restore-state [_ physical-root opts]
@@ -158,6 +171,7 @@
                      current (assoc (:request-id current)
                                     (assoc current :physical-root physical-root)))]
       {:database-id (get node "database-id") :basis-t basis-t
+       :safe-epoch (get node "safe-epoch" 0)
        :runs (when-not (:lazy? opts) (load-run-refs get-fn refs-by-index))
        :run-refs refs-by-index :lsm-root lsm-root
        :history (read-field node "history-edn") :requests requests
@@ -180,6 +194,7 @@
           (throw (ex-info "request-id was already used for another transaction"
                           {:type :kotobase.engine/idempotency-conflict})))
         (let [epoch (inc (:basis-t state))
+              safe-epoch (next-safe-epoch reader-pins-fn state epoch)
               current-runs (or (:runs state)
                                (load-run-refs get-fn (:run-refs state)))
               new-runs (lsm/build-index-run-ranges
@@ -188,11 +203,12 @@
               _ (doseq [runs (vals new-runs) run runs]
                   (persist-effects! put! (:effects run)))
               all-runs (compact-runs-if-needed
-                        put! database-id target-run-rows
+                        put! database-id safe-epoch target-run-rows
                         l0-compaction-threshold
                         (merge-with into current-runs new-runs))
               lsm-manifest (lsm/build-manifest
                             {:db-id database-id :epoch epoch
+                             :safe-epoch safe-epoch
                              :previous (:lsm-root state)
                              :indexes (run-refs all-runs)})
               _ (persist-effects! put! (:effects lsm-manifest))
@@ -200,7 +216,9 @@
               appended (mapv (fn [{:keys [e a v op]}]
                                {:e e :a a :v v :t epoch
                                 :added (= :assert op)}) tx)
-              next-state (-> state (assoc :basis-t epoch :runs all-runs
+              next-state (-> state (assoc :basis-t epoch
+                                          :safe-epoch safe-epoch
+                                          :runs all-runs
                                           :run-refs
                                           (into {}
                                                 (map (fn [[index values]]
@@ -225,10 +243,12 @@
 
   (-open-snapshot [_ state selector]
     (let [basis (:basis-t state)
+          safe-epoch (:safe-epoch state 0)
           as-of (get selector :as-of basis)]
-      (when-not (and (integer? as-of) (<= 0 as-of basis))
+      (when-not (and (integer? as-of) (<= safe-epoch as-of basis))
         (throw (ex-info "snapshot :as-of is outside the database basis"
-                        {:type :kotobase.engine/invalid-snapshot-selector})))
+                        {:type :kotobase.engine/invalid-snapshot-selector
+                         :safe-epoch safe-epoch :basis-t basis :as-of as-of})))
       {:database-id (:database-id state) :basis-t as-of :runs (:runs state)
        :run-refs (:run-refs state)
        :history (:history state) :history? (true? (:history selector))
@@ -257,8 +277,10 @@
        :physical-root physical-root :engine lsm-profile})))
 
 (defn lsm-engine
-  [{:keys [put! get-fn digest-fn target-run-rows l0-compaction-threshold]
-    :or {target-run-rows 4096 l0-compaction-threshold 8}}]
+  [{:keys [put! get-fn digest-fn target-run-rows l0-compaction-threshold
+           reader-pins-fn]
+    :or {target-run-rows 4096 l0-compaction-threshold 8
+         reader-pins-fn (constantly [])}}]
   (doseq [[capability value] [[:put! put!] [:get-fn get-fn]
                               [:digest-fn digest-fn]]]
     (when-not (ifn? value)
@@ -269,5 +291,9 @@
     (throw (ex-info "LSM compaction threshold must be a positive integer"
                     {:type :kotobase.engine/invalid-compaction-threshold
                      :threshold l0-compaction-threshold})))
+  (when-not (ifn? reader-pins-fn)
+    (throw (ex-info "LSM engine reader-pins-fn must be callable"
+                    {:type :kotobase.engine/missing-capability
+                     :capability :reader-pins-fn})))
   (->MerkleLsmEngine put! get-fn digest-fn target-run-rows
-                     l0-compaction-threshold))
+                     l0-compaction-threshold reader-pins-fn))

@@ -7,10 +7,11 @@ Arrangement, S3 or a deployment runtime.
 Each transaction appends immutable covering-index L0 runs and writes a small
 engine manifest above the Merkle-LSM VersionManifest. Reads apply MVCC visibility
 at the requested epoch. The transaction path deterministically compacts an L0
-index when `:l0-compaction-threshold` (default 8) is reached. It uses safe epoch
-zero, so compaction bounds read fan-in without discarding any historical MVCC
-version. Advancing the safe epoch remains the responsibility of a future
-reader-pin/retention policy.
+index when `:l0-compaction-threshold` (default 8) is reached. Hosts may inject
+`:reader-pins-fn`; the engine computes a monotonic safe epoch from active query,
+replica and legal-hold pins, persists it in both manifests, and rejects snapshot
+opens below the retained boundary. With no pins the conservative default stays
+at epoch zero and preserves every historical MVCC version.
 
 With `{:lazy? true}`, restore reads only the engine manifest and the
 Merkle-LSM VersionManifest. Point scans choose a covering index from the query

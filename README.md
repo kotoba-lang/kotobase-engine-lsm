@@ -12,8 +12,14 @@ zero, so compaction bounds read fan-in without discarding any historical MVCC
 version. Advancing the safe epoch remains the responsibility of a future
 reader-pin/retention policy.
 
-This JVM qualification path still loads referenced runs during restore.
-Range-pruned async provider reads remain a separate qualification step.
+With `{:lazy? true}`, restore reads only the engine manifest and the
+Merkle-LSM VersionManifest. Point scans choose a covering index from the query
+pattern and use each run ref's first-component range to load only candidates;
+older refs without range metadata remain correctness-safe by being retained.
+The JVM regression resolves one entity from 13 EAVT runs with three run GETs.
+
+An asynchronous CLJS/provider coordinator remains a separate qualification
+step; the range selection and lazy state shape no longer require full restore.
 
 ```sh
 clojure -M:test

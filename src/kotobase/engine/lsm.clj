@@ -33,10 +33,13 @@
           :when (= :block/put type)]
     (put! cid bytes)))
 
+(defn- run-ref-of [run]
+  (or (:ref run) (lsm/run-ref run)))
+
 (defn- run-refs [runs]
   (into {}
         (map (fn [[index values]]
-               [index {:l0 (mapv lsm/run-ref values)}]))
+               [index {:l0 (mapv run-ref-of values)}]))
         runs))
 
 (defn- compact-runs-if-needed
@@ -77,26 +80,55 @@
                            (let [block-cid (ipld/link-cid (get descriptor "cid"))]
                              (get (ipld/decode (get-fn block-cid)) "rows")))
                          (get node "blocks")))]
-    {:cid cid :node node :rows (vec rows)
+    {:cid cid :node node :rows (vec rows) :ref ref
      :index (keyword (get node "index"))
      :count (get node "count")}))
 
-(defn- load-runs [get-fn manifest]
+(defn- manifest-run-refs [manifest]
   (into {}
         (keep (fn [[index levels]]
-                (let [refs (mapcat val levels)]
-                  (when (seq refs)
-                    [(keyword index) (mapv #(load-run get-fn %) refs)]))))
+                (let [refs (vec (mapcat val levels))]
+                  (when (seq refs) [(keyword index) refs]))))
         (get manifest "indexes")))
 
-(defn- logical-rows [runs basis-t]
-  (->> (lsm/visible-rows (get runs :eavt []) basis-t)
+(defn- load-run-refs [get-fn refs-by-index]
+  (into {}
+        (map (fn [[index refs]]
+               [index (mapv #(load-run get-fn %) refs)]))
+        refs-by-index))
+
+(defn- ordered->eav [index components]
+  (case index
+    :eavt components
+    :aevt [(nth components 1) (nth components 0) (nth components 2)]
+    :avet [(nth components 2) (nth components 0) (nth components 1)]
+    :vaet [(nth components 2) (nth components 1) (nth components 0)]))
+
+(defn- logical-rows
+  ([runs basis-t] (logical-rows runs :eavt basis-t))
+  ([runs index basis-t]
+   (->> (lsm/visible-rows (get runs index []) basis-t)
        (map (fn [row]
-              (let [[e a v] (get row "components")]
+              (let [[e a v] (ordered->eav index (get row "components"))]
                 {:e (decode-component e) :a (decode-component a)
                  :v (decode-component v) :t (get row "epoch")
                  :added true})))
-       canonical/canonical-datoms))
+       canonical/canonical-datoms)))
+
+(defn- scan-index [pattern]
+  (let [[e a v] pattern]
+    (cond
+      (some? e) [:eavt (encode-component e)]
+      (and (some? a) (some? v)) [:avet (encode-component a)]
+      (some? a) [:aevt (encode-component a)]
+      :else [:eavt ""])))
+
+(defn- lazy-logical-rows [get-fn refs-by-index basis-t pattern]
+  (let [[index prefix] (scan-index pattern)
+        selected (lsm/select-run-refs-by-first-component
+                  (get refs-by-index index []) prefix)]
+    (logical-rows {index (mapv #(load-run get-fn %) selected)}
+                  index basis-t)))
 
 (defn- matches? [[pe pa pv] {:keys [e a v]}]
   (and (or (nil? pe) (= pe e))
@@ -108,10 +140,10 @@
   contract/IEngine
   (-engine-profile [_] lsm-profile)
   (-empty-state [_ {:keys [database-id]}]
-    {:database-id database-id :basis-t 0 :runs {} :history []
+    {:database-id database-id :basis-t 0 :runs {} :run-refs {} :history []
      :requests {} :snapshots {}})
 
-  (-restore-state [_ physical-root _opts]
+  (-restore-state [_ physical-root opts]
     (let [node (ipld/decode (get-fn physical-root))
           _ (when-not (and (= "kotobase-engine-lsm" (get node "engine"))
                            (= engine-format-version (get node "format-version")))
@@ -120,12 +152,14 @@
           basis-t (get node "basis-t")
           lsm-root (ipld/link-cid (get node "lsm-manifest"))
           lsm-manifest (ipld/decode (get-fn lsm-root))
+          refs-by-index (manifest-run-refs lsm-manifest)
           current (read-field node "current-request-edn")
           requests (cond-> (read-field node "requests-edn")
                      current (assoc (:request-id current)
                                     (assoc current :physical-root physical-root)))]
       {:database-id (get node "database-id") :basis-t basis-t
-       :runs (load-runs get-fn lsm-manifest)
+       :runs (when-not (:lazy? opts) (load-run-refs get-fn refs-by-index))
+       :run-refs refs-by-index :lsm-root lsm-root
        :history (read-field node "history-edn") :requests requests
        :snapshots (assoc (read-field node "snapshots-edn") basis-t physical-root)
        :physical-root physical-root}))
@@ -146,6 +180,8 @@
           (throw (ex-info "request-id was already used for another transaction"
                           {:type :kotobase.engine/idempotency-conflict})))
         (let [epoch (inc (:basis-t state))
+              current-runs (or (:runs state)
+                               (load-run-refs get-fn (:run-refs state)))
               new-runs (lsm/build-index-run-ranges
                         database-id epoch target-run-rows
                         (mapv encode-datom tx))
@@ -154,7 +190,7 @@
               all-runs (compact-runs-if-needed
                         put! database-id target-run-rows
                         l0-compaction-threshold
-                        (merge-with into (:runs state) new-runs))
+                        (merge-with into current-runs new-runs))
               lsm-manifest (lsm/build-manifest
                             {:db-id database-id :epoch epoch
                              :previous (:lsm-root state)
@@ -165,6 +201,12 @@
                                {:e e :a a :v v :t epoch
                                 :added (= :assert op)}) tx)
               next-state (-> state (assoc :basis-t epoch :runs all-runs
+                                          :run-refs
+                                          (into {}
+                                                (map (fn [[index values]]
+                                                       [index (mapv run-ref-of
+                                                                    values)]))
+                                                all-runs)
                                           :lsm-root lsm-root)
                              (update :history into appended))
               current {:request-id request-id :tx-root tx-root :epoch epoch}
@@ -188,21 +230,27 @@
         (throw (ex-info "snapshot :as-of is outside the database basis"
                         {:type :kotobase.engine/invalid-snapshot-selector})))
       {:database-id (:database-id state) :basis-t as-of :runs (:runs state)
+       :run-refs (:run-refs state)
        :history (:history state) :history? (true? (:history selector))
        :physical-root (get-in state [:snapshots as-of])}))
 
-  (-scan [_ {:keys [runs basis-t history history?]} pattern _opts]
+  (-scan [_ {:keys [runs run-refs basis-t history history?]} pattern _opts]
     (->> (if history?
            (->> history (filter #(<= (:t %) basis-t))
                 canonical/canonical-datoms)
-           (logical-rows runs basis-t))
+           (if runs
+             (logical-rows runs basis-t)
+             (lazy-logical-rows get-fn run-refs basis-t pattern)))
          (filter #(matches? pattern %)) vec))
 
   (-history [_ {:keys [history basis-t]} _opts]
     (->> history (filter #(<= (:t %) basis-t)) canonical/canonical-datoms))
 
-  (-checkpoint [this {:keys [database-id basis-t runs physical-root]} _opts]
-    (let [rows (logical-rows runs basis-t)]
+  (-checkpoint [this {:keys [database-id basis-t runs run-refs physical-root]}
+                _opts]
+    (let [rows (if runs
+                 (logical-rows runs basis-t)
+                 (lazy-logical-rows get-fn run-refs basis-t [nil nil nil]))]
       {:database-id database-id :epoch basis-t
        :logical-checkpoint-root
        (digest this (canonical/checkpoint-datoms rows))

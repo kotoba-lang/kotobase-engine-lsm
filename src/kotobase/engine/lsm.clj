@@ -39,6 +39,22 @@
                [index {:l0 (mapv lsm/run-ref values)}]))
         runs))
 
+(defn- compact-runs-if-needed
+  "Bound L0 fan-in without invalidating any historical snapshot. Safe epoch
+  zero deliberately retains every MVCC version; advancing it belongs to a
+  future reader-pin/retention policy, not to transaction execution."
+  [put! database-id target-run-rows threshold runs]
+  (into {}
+        (map (fn [[index values]]
+               (if (< (count values) threshold)
+                 [index values]
+                 (let [compacted (lsm/compact-runs-partitioned
+                                  index database-id 0 target-run-rows values)]
+                   (doseq [run compacted]
+                     (persist-effects! put! (:effects run)))
+                   [index compacted]))))
+        runs))
+
 (defn- manifest-node [state lsm-root current-request]
   {"engine" "kotobase-engine-lsm"
    "format-version" engine-format-version
@@ -87,7 +103,8 @@
        (or (nil? pa) (= pa a))
        (or (nil? pv) (= pv v))))
 
-(defrecord MerkleLsmEngine [put! get-fn digest-fn target-run-rows]
+(defrecord MerkleLsmEngine [put! get-fn digest-fn target-run-rows
+                            l0-compaction-threshold]
   contract/IEngine
   (-engine-profile [_] lsm-profile)
   (-empty-state [_ {:keys [database-id]}]
@@ -134,7 +151,10 @@
                         (mapv encode-datom tx))
               _ (doseq [runs (vals new-runs) run runs]
                   (persist-effects! put! (:effects run)))
-              all-runs (merge-with into (:runs state) new-runs)
+              all-runs (compact-runs-if-needed
+                        put! database-id target-run-rows
+                        l0-compaction-threshold
+                        (merge-with into (:runs state) new-runs))
               lsm-manifest (lsm/build-manifest
                             {:db-id database-id :epoch epoch
                              :previous (:lsm-root state)
@@ -189,13 +209,17 @@
        :physical-root physical-root :engine lsm-profile})))
 
 (defn lsm-engine
-  [{:keys [put! get-fn digest-fn target-run-rows]
-    :or {target-run-rows 4096}}]
+  [{:keys [put! get-fn digest-fn target-run-rows l0-compaction-threshold]
+    :or {target-run-rows 4096 l0-compaction-threshold 8}}]
   (doseq [[capability value] [[:put! put!] [:get-fn get-fn]
                               [:digest-fn digest-fn]]]
     (when-not (ifn? value)
       (throw (ex-info "LSM engine requires injected capability"
                       {:type :kotobase.engine/missing-capability
                        :capability capability}))))
-  (->MerkleLsmEngine put! get-fn digest-fn target-run-rows))
-
+  (when-not (pos-int? l0-compaction-threshold)
+    (throw (ex-info "LSM compaction threshold must be a positive integer"
+                    {:type :kotobase.engine/invalid-compaction-threshold
+                     :threshold l0-compaction-threshold})))
+  (->MerkleLsmEngine put! get-fn digest-fn target-run-rows
+                     l0-compaction-threshold))

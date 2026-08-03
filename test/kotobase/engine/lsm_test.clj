@@ -1,5 +1,6 @@
 (ns kotobase.engine.lsm-test
   (:require [clojure.test :refer [deftest is]]
+            [ipld.core :as ipld]
             [kotobase.engine.conformance :as conformance]
             [kotobase.engine.contract :as engine]
             [kotobase.engine.lsm :as lsm]
@@ -77,6 +78,44 @@
                                                 {:as-of epoch})
                           [nil nil nil]))
           "safe epoch zero preserves every historical snapshot"))))
+
+(deftest reader-pins-advance-and-persist-safe-epoch
+  (let [pins (atom [])
+        candidate (:engine
+                   (fixture {:l0-compaction-threshold 2
+                             :target-run-rows 8
+                             :reader-pins-fn #(deref pins)}))
+        database-id "lsm/pinned"
+        transact-one
+        (fn [state n]
+          (:state
+           (engine/transact
+            candidate state
+            {:database-id database-id :request-id (str "pin-" n)
+             :tx-data (cond-> []
+                        (> n 1) (conj [:db/retract "entity" :value (dec n)])
+                        true (conj [:db/add "entity" :value n]))})))
+        s1 (transact-one (engine/empty-state candidate database-id) 1)
+        s2 (transact-one s1 2)
+        _ (reset! pins [{:manifest-cid (:physical-root s2)
+                         :epoch 1 :epoch-readers [1]}])
+        s3 (transact-one s2 3)
+        restored (engine/restore-state candidate (:physical-root s3))]
+    (is (= 1 (:safe-epoch s3)))
+    (is (= 1 (:safe-epoch restored)) "safe epoch survives engine restore")
+    (is (= 1 (get (ipld/decode
+                   ((:get-fn candidate) (:lsm-root restored)))
+                  "safe-epoch"))
+        "safe epoch is also committed by the LSM manifest")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"outside the database basis"
+         (engine/open-snapshot candidate restored {:as-of 0})))
+    (is (= [2]
+           (mapv :v
+                 (engine/scan candidate
+                              (engine/open-snapshot candidate restored
+                                                    {:as-of 2})
+                              ["entity" :value nil]))))))
 
 (deftest lazy-restore-range-prunes-point-reads
   (let [{writer :engine blocks :blocks}

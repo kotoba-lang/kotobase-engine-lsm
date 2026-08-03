@@ -19,10 +19,14 @@ pattern and use each run ref's first-component range to load only candidates;
 older refs without range metadata remain correctness-safe by being retained.
 The JVM regression resolves one entity from 13 EAVT runs with three run GETs.
 
-An asynchronous CLJS/provider coordinator remains a separate qualification
-step; the range selection and lazy state shape no longer require full restore.
+The ClojureScript coordinator keeps provider I/O asynchronous while the engine
+mechanism stays deterministic. Restore fetches only the engine and LSM
+manifests; point scans batch-fetch range-selected run nodes and children. Cold
+writes hydrate existing runs asynchronously, upload every immutable block, and
+only then expose the new manifest through linearizable CAS.
 
 ```sh
 clojure -M:test
 clojure -M:lint
+npm run test:cljs
 ```

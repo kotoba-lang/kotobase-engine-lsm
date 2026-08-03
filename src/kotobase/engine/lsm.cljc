@@ -116,7 +116,9 @@
                  :added true})))
        canonical/canonical-datoms)))
 
-(defn- scan-index [pattern]
+(defn scan-index
+  "Choose a covering index and encoded first-component prefix for PATTERN."
+  [pattern]
   (let [[e a v] pattern]
     (cond
       (some? e) [:eavt (encode-component e)]
@@ -124,10 +126,20 @@
       (some? a) [:aevt (encode-component a)]
       :else [:eavt ""])))
 
+(defn scan-run-refs
+  "Select only run refs whose first-component range can cover PATTERN."
+  [refs-by-index pattern]
+  (let [[index prefix] (scan-index pattern)]
+    [index (lsm/select-run-refs-by-first-component
+            (get refs-by-index index []) prefix)]))
+
+(defn run-node-child-cids
+  "Return child block CIDs referenced by a decoded run node."
+  [node]
+  (mapv (comp ipld/link-cid #(get % "cid")) (get node "blocks" [])))
+
 (defn- lazy-logical-rows [get-fn refs-by-index basis-t pattern]
-  (let [[index prefix] (scan-index pattern)
-        selected (lsm/select-run-refs-by-first-component
-                  (get refs-by-index index []) prefix)]
+  (let [[index selected] (scan-run-refs refs-by-index pattern)]
     (logical-rows {index (mapv #(load-run get-fn %) selected)}
                   index basis-t)))
 

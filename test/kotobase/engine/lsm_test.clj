@@ -77,3 +77,48 @@
                                                 {:as-of epoch})
                           [nil nil nil]))
           "safe epoch zero preserves every historical snapshot"))))
+
+(deftest lazy-restore-range-prunes-point-reads
+  (let [{writer :engine blocks :blocks}
+        (fixture {:target-run-rows 8 :l0-compaction-threshold 1000})
+        database-id "lsm/lazy"
+        seeded (:state
+                (engine/transact
+                 writer (engine/empty-state writer database-id)
+                 {:database-id database-id :request-id "seed"
+                  :tx-data (mapv (fn [n]
+                                   [:db/add (str "entity-" n) :value n])
+                                 (range 100))}))
+        gets (atom 0)
+        reader (lsm/lsm-engine
+                {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                 :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+                 :digest-fn digest-fn
+                 :target-run-rows 8
+                 :l0-compaction-threshold 1000})
+        restored (engine/restore-state reader (:physical-root seeded)
+                                       {:lazy? true})
+        restore-gets @gets
+        rows (engine/scan reader (engine/open-snapshot reader restored)
+                          ["entity-50" :value nil])
+        point-gets (- @gets restore-gets)
+        eavt-runs (count (get (:run-refs restored) :eavt))
+        cold-next (:state
+                   (engine/transact
+                    reader restored
+                    {:database-id database-id :request-id "cold-write"
+                     :tx-data [[:db/retract "entity-50" :value 50]
+                               [:db/add "entity-101" :value 101]]}))]
+    (is (nil? (:runs restored)) "restore retains run refs, not decoded runs")
+    (is (= 2 restore-gets) "restore reads only engine and LSM manifests")
+    (is (= [50] (mapv :v rows)))
+    (is (<= point-gets 3) "the entity range selects a bounded run subset")
+    (is (< point-gets eavt-runs)
+        "point lookup does not fetch every EAVT run")
+    (is (empty? (engine/scan reader (engine/open-snapshot reader cold-next)
+                             ["entity-50" :value nil])))
+    (is (= [101]
+           (mapv :v (engine/scan reader
+                                 (engine/open-snapshot reader cold-next)
+                                 ["entity-101" :value nil])))
+        "a lazy state can hydrate for a mixed cold transaction")))

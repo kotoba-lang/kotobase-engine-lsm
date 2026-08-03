@@ -7,13 +7,16 @@
 
 (def digest-fn #(str "digest:" (hash %)))
 
-(defn fixture []
+(defn fixture
+  ([] (fixture {}))
+  ([options]
   (let [blocks (atom {})]
     {:blocks blocks
      :engine (lsm/lsm-engine
-              {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
-               :get-fn #(get @blocks %)
-               :digest-fn digest-fn})}))
+              (merge {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                      :get-fn #(get @blocks %)
+                      :digest-fn digest-fn}
+                     options))})))
 
 (deftest shared-conformance
   (is (:passed? (conformance/verify (:engine (fixture))))))
@@ -45,3 +48,32 @@
            (:logical-checkpoint-root
             (engine/checkpoint candidate
                                (engine/open-snapshot candidate restored)))))))
+
+(deftest transaction-path-compacts-l0-without-losing-snapshots
+  (let [candidate (:engine (fixture {:l0-compaction-threshold 2
+                                     :target-run-rows 64}))
+        database-id "lsm/compaction"
+        states (reductions
+                (fn [state epoch]
+                  (:state
+                   (engine/transact
+                    candidate state
+                    {:database-id database-id
+                     :request-id (str "c" epoch)
+                     :tx-data [[:db/add "counter" :value epoch]]})))
+                (engine/empty-state candidate database-id)
+                (range 1 5))
+        final-state (last states)
+        restored (engine/restore-state candidate (:physical-root final-state))]
+    (is (every? #(<= (count %) 1) (vals (:runs final-state)))
+        "the engine replaces threshold-sized L0 sets with compacted runs")
+    (doseq [epoch (range 1 5)]
+      (is (= (engine/scan candidate
+                          (engine/open-snapshot candidate (nth states epoch)
+                                                {:as-of epoch})
+                          [nil nil nil])
+             (engine/scan candidate
+                          (engine/open-snapshot candidate restored
+                                                {:as-of epoch})
+                          [nil nil nil]))
+          "safe epoch zero preserves every historical snapshot"))))

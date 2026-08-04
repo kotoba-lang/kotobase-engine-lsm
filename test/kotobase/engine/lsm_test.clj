@@ -66,7 +66,8 @@
                 (range 1 5))
         final-state (last states)
         restored (engine/restore-state candidate (:physical-root final-state))]
-    (is (every? #(<= (count %) 1) (vals (:runs final-state)))
+    (is (every? #(<= (count %) 1)
+                (map (:runs final-state) [:eavt :aevt :avet :vaet]))
         "the engine replaces threshold-sized L0 sets with compacted runs")
     (doseq [epoch (range 1 5)]
       (is (= (engine/scan candidate
@@ -242,3 +243,37 @@
                                  (engine/open-snapshot reader cold-next)
                                  ["entity-101" :value nil])))
         "a lazy state can hydrate for a mixed cold transaction")))
+
+(deftest manifest-envelope-is-bounded-and-request-index-survives-cold-restore
+  (let [{candidate :engine blocks :blocks}
+        (fixture {:target-run-rows 16 :l0-compaction-threshold 4})
+        database-id "lsm/bounded-metadata"
+        final-state
+        (reduce (fn [state n]
+                  (:state
+                   (engine/transact
+                    candidate state
+                    {:database-id database-id :request-id (str "request-" n)
+                     :tx-data [[:db/add (str "entity-" n) :value n]]})))
+                (engine/empty-state candidate database-id)
+                (range 96))
+        root (:physical-root final-state)
+        envelope-bytes (get @blocks root)
+        envelope (ipld/decode envelope-bytes)
+        restored (engine/restore-state candidate root)]
+    (is (= 2 (get envelope "format-version")))
+    (is (not-any? #(contains? envelope %)
+                  ["history-edn" "requests-edn" "snapshots-edn"])
+        "the head envelope no longer duplicates cumulative transaction state")
+    (is (< (alength envelope-bytes) 1024)
+        "head-envelope bytes stay bounded as transaction count grows")
+    (is (= 96 (count (lsm/request-records candidate restored))))
+    (is (= :replayed
+           (get-in (engine/transact
+                    candidate restored
+                    {:database-id database-id :request-id "request-0"
+                     :tx-data [[:db/add "entity-0" :value 0]]})
+                   [:receipt :status]))
+        "a non-current request remains idempotent after cold restore")
+    (is (= 96 (count (engine/history
+                      candidate (engine/open-snapshot candidate restored)))))))

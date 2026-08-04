@@ -8,7 +8,7 @@
             [merkle-lsm.compaction :as compaction]
             [merkle-lsm.core :as lsm]))
 
-(def engine-format-version 1)
+(def engine-format-version 2)
 
 (def lsm-profile
   (-> profile/merkle-lsm
@@ -61,8 +61,11 @@
                      l1 (vec (:l1 levels))]
                  (if (< (count l0) threshold)
                    [index levels]
-                   (let [result (compaction/compact-with-level
-                                 index database-id safe-epoch target-run-rows
+                   (let [physical-index (if (= :request index) :eavt index)
+                         tenant (if (= :request index)
+                                  (str database-id "/requests") database-id)
+                         result (compaction/compact-with-level
+                                 physical-index tenant safe-epoch target-run-rows
                                  l0 l1)]
                      (doseq [run (:compacted result)]
                      (persist-effects! put! (:effects run)))
@@ -76,10 +79,32 @@
    "basis-t" (:basis-t state)
    "safe-epoch" (:safe-epoch state 0)
    "lsm-manifest" (ipld/link lsm-root)
-   "history-edn" (pr-str (:history state))
-   "requests-edn" (pr-str (:requests state))
-   "snapshots-edn" (pr-str (:snapshots state))
    "current-request-edn" (pr-str current-request)})
+
+(defn- put-lsm-manifest!
+  "Persist the engine's run directory. The upstream Merkle-LSM manifest
+  validator intentionally knows only graph indexes; this engine adds one
+  physically-EAVT metadata directory named request, so the envelope owns the
+  small extension while retaining the same DAG-CBOR shape."
+  [put! database-id epoch safe-epoch indexes]
+  (ipld/put-node!
+   put!
+   (cond-> {"format" "kotobase/version-manifest"
+            "version" 1
+            "db-id" (str database-id)
+            "epoch" epoch
+            "safe-epoch" safe-epoch
+            "indexes"
+            (into (sorted-map)
+                  (map (fn [[index levels]]
+                         [(name index)
+                          (into (sorted-map)
+                                (keep (fn [[level refs]]
+                                        (when (seq refs)
+                                          [(name level) (vec refs)])))
+                                levels)]))
+                  indexes)
+            "statistics" {}})))
 
 (defn- read-field [node key]
   (edn/read-string (get node key)))
@@ -134,6 +159,62 @@
                  :added true})))
        canonical/canonical-datoms)))
 
+(defn- history-rows
+  "Derive transaction history from the EAVT MVCC rows instead of duplicating
+  it in every engine manifest. Compaction retains exactly the history that is
+  queryable at or after safe-epoch."
+  [runs basis-t]
+  (->> (get runs :eavt [])
+       (mapcat #(or (:rows %) (get-in % [:node "rows"])))
+       distinct
+       (filter #(<= (get % "epoch") basis-t))
+       (map (fn [row]
+              (let [[e a v] (get row "components")]
+                {:e (decode-component e) :a (decode-component a)
+                 :v (decode-component v) :t (get row "epoch")
+                 :added (= "assert" (get row "op"))})))
+       canonical/canonical-datoms))
+
+(defn- request-entry [request-id tx-root epoch]
+  {:components [(encode-component request-id)]
+   :epoch epoch :op :assert
+   :value (encode-component {:request-id request-id
+                             :tx-root tx-root :epoch epoch})})
+
+(defn- request-record-from-runs [runs request-id basis-t]
+  (some->> (lsm/visible-rows (get runs :request []) basis-t)
+           (some (fn [row]
+                   (when (= [(encode-component request-id)]
+                            (get row "components"))
+                     (decode-component (get row "value")))))))
+
+(defn request-record
+  "Return REQUEST-ID's durable idempotency record from the metadata LSM.
+  Providers may hydrate only the covering request runs before calling this."
+  [engine state request-id]
+  (or (get-in state [:request-cache request-id])
+      (get-in state [:legacy-requests request-id])
+      (let [runs (or (:runs state)
+                     {:request
+                      (mapv #(load-run (:get-fn engine) %)
+                            (lsm/select-run-refs-by-first-component
+                             (get (:run-refs state) :request [])
+                             (encode-component request-id)))})]
+        (request-record-from-runs runs request-id (:basis-t state)))))
+
+(defn request-records
+  "All durable request records, ordered by epoch. Intended for metadata/log
+  APIs; normal transactions use request-record's point lookup."
+  [engine state]
+  (let [runs (or (:runs state)
+                 {:request (mapv #(load-run (:get-fn engine) %)
+                                 (get (:run-refs state) :request []))})]
+    (->> (lsm/visible-rows (get runs :request []) (:basis-t state))
+         (map #(decode-component (get % "value")))
+         (concat (vals (:legacy-requests state)))
+         (sort-by :epoch)
+         vec)))
+
 (defn scan-index
   "Choose a covering index and encoded first-component prefix for PATTERN."
   [pattern]
@@ -155,6 +236,17 @@
   "Return child block CIDs referenced by a decoded run node."
   [node]
   (mapv (comp ipld/link-cid #(get % "cid")) (get node "blocks" [])))
+
+(defn load-run-cached
+  "Load a run whose root and child blocks are already in ENGINE's cache."
+  [engine ref]
+  (load-run (:get-fn engine) ref))
+
+(defn request-run-refs
+  "Select request-index refs that can contain REQUEST-ID."
+  [state request-id]
+  (lsm/select-run-refs-by-first-component
+   (get (:run-refs state) :request []) (encode-component request-id)))
 
 (defn- lazy-logical-rows [get-fn refs-by-index basis-t pattern]
   (let [[index selected] (scan-run-refs refs-by-index pattern)]
@@ -184,13 +276,13 @@
   (-engine-profile [_] lsm-profile)
   (-empty-state [_ {:keys [database-id]}]
      {:database-id database-id :basis-t 0 :safe-epoch 0
-     :levels {} :level-refs {} :runs {} :run-refs {} :history []
-     :requests {} :snapshots {}})
+     :levels {} :level-refs {} :runs {} :run-refs {}})
 
   (-restore-state [_ physical-root opts]
     (let [node (ipld/decode (get-fn physical-root))
+          format-version (get node "format-version")
           _ (when-not (and (= "kotobase-engine-lsm" (get node "engine"))
-                           (= engine-format-version (get node "format-version")))
+                           (contains? #{1 engine-format-version} format-version))
               (throw (ex-info "unsupported LSM engine manifest"
                               {:type :kotobase.engine/unsupported-manifest})))
           basis-t (get node "basis-t")
@@ -200,17 +292,20 @@
           refs-by-index (flatten-levels level-refs)
           levels (when-not (:lazy? opts) (load-level-refs get-fn level-refs))
           current (read-field node "current-request-edn")
-          requests (cond-> (read-field node "requests-edn")
-                     current (assoc (:request-id current)
-                                    (assoc current :physical-root physical-root)))]
-      {:database-id (get node "database-id") :basis-t basis-t
+          legacy? (= 1 format-version)
+          legacy-requests (when legacy?
+                            (cond-> (read-field node "requests-edn")
+                              current (assoc (:request-id current) current)))]
+      (cond->
+       {:database-id (get node "database-id") :basis-t basis-t
        :safe-epoch (get node "safe-epoch" 0)
        :levels levels :level-refs level-refs
        :runs (when levels (flatten-levels levels))
        :run-refs refs-by-index :lsm-root lsm-root
-       :history (read-field node "history-edn") :requests requests
-       :snapshots (assoc (read-field node "snapshots-edn") basis-t physical-root)
-       :physical-root physical-root}))
+       :current-request (when current
+                          (assoc current :physical-root physical-root))
+       :physical-root physical-root}
+        legacy? (assoc :legacy-requests legacy-requests))))
 
   (-transact [this state {:keys [database-id request-id tx-data]}]
     (when-not (= database-id (:database-id state))
@@ -218,69 +313,80 @@
                       {:type :kotobase.engine/database-mismatch})))
     (let [tx (canonical/normalize-tx tx-data)
           tx-root (digest this tx)]
-      (if-let [prior (get-in state [:requests request-id])]
+      (if-let [prior (request-record this state request-id)]
         (if (= tx-root (:tx-root prior))
           {:state state
            :receipt {:database-id database-id :epoch (:epoch prior)
                      :request-id request-id :tx-root tx-root
-                     :physical-root (:physical-root prior) :engine lsm-profile
+                     :physical-root (or (:physical-root prior)
+                                        (:physical-root state)) :engine lsm-profile
                      :status :replayed}}
           (throw (ex-info "request-id was already used for another transaction"
                           {:type :kotobase.engine/idempotency-conflict})))
         (let [epoch (inc (:basis-t state))
               safe-epoch (next-safe-epoch reader-pins-fn state epoch)
-              current-levels (or (:levels state)
-                                 (when (:runs state)
-                                   (into {} (map (fn [[index runs]]
-                                                   [index {:l0 runs}]))
-                                         (:runs state)))
-                                 (load-level-refs get-fn (:level-refs state)))
-              new-runs (lsm/build-index-run-ranges
-                        database-id epoch target-run-rows
-                        (mapv encode-datom tx))
+              current-levels
+              (when (or inline-compaction? (some? (:levels state)))
+                (or (:levels state)
+                    (when (:runs state)
+                      (into {} (map (fn [[index runs]]
+                                      [index {:l0 runs}]))
+                            (:runs state)))
+                    (load-level-refs get-fn (:level-refs state))))
+              data-runs (lsm/build-index-run-ranges
+                         database-id epoch target-run-rows
+                         (mapv encode-datom tx))
+              legacy-request-entries
+              (mapv (fn [[legacy-id record]]
+                      (request-entry legacy-id (:tx-root record)
+                                     (:epoch record)))
+                    (:legacy-requests state))
+              request-runs
+              (lsm/build-run-ranges
+               :eavt (str database-id "/requests") target-run-rows
+               (conj legacy-request-entries
+                     (request-entry request-id tx-root epoch)))
+              new-runs (assoc data-runs :request request-runs)
               _ (doseq [runs (vals new-runs) run runs]
                   (persist-effects! put! (:effects run)))
-              appended-levels
-              (reduce-kv (fn [levels index runs]
-                           (update-in levels [index :l0] (fnil into []) runs))
-                         current-levels new-runs)
-              all-levels (if inline-compaction?
-                         (compact-levels-if-needed
-                          put! database-id safe-epoch target-run-rows
-                          l0-compaction-threshold appended-levels)
-                         appended-levels)
-              all-runs (flatten-levels all-levels)
-              lsm-manifest (lsm/build-manifest
-                            {:db-id database-id :epoch epoch
-                             :safe-epoch safe-epoch
-                             :previous (:lsm-root state)
-                             :indexes (level-refs-of all-levels)})
-              _ (persist-effects! put! (:effects lsm-manifest))
-              lsm-root (:cid lsm-manifest)
-              appended (mapv (fn [{:keys [e a v op]}]
-                               {:e e :a a :v v :t epoch
-                                :added (= :assert op)}) tx)
+              appended-levels (when current-levels
+                                (reduce-kv
+                                 (fn [levels index runs]
+                                   (update-in levels [index :l0] (fnil into []) runs))
+                                 current-levels new-runs))
+              all-levels (when appended-levels
+                           (if inline-compaction?
+                             (compact-levels-if-needed
+                              put! database-id safe-epoch target-run-rows
+                              l0-compaction-threshold appended-levels)
+                             appended-levels))
+              new-run-refs (into {} (map (fn [[index runs]]
+                                           [index (mapv run-ref-of runs)]))
+                                 new-runs)
+              all-level-refs
+              (if all-levels
+                (level-refs-of all-levels)
+                (reduce-kv (fn [refs index values]
+                             (update-in refs [index :l0] (fnil into []) values))
+                           (:level-refs state) new-run-refs))
+              all-runs (when all-levels (flatten-levels all-levels))
+              lsm-root (put-lsm-manifest!
+                        put! database-id epoch safe-epoch all-level-refs)
               next-state (-> state (assoc :basis-t epoch
                                           :safe-epoch safe-epoch
                                           :levels all-levels
-                                          :level-refs (level-refs-of all-levels)
+                                          :level-refs all-level-refs
                                           :runs all-runs
-                                          :run-refs
-                                          (into {}
-                                                (map (fn [[index values]]
-                                                       [index (mapv run-ref-of
-                                                                    values)]))
-                                                all-runs)
+                                          :run-refs (flatten-levels all-level-refs)
                                           :lsm-root lsm-root)
-                             (update :history into appended))
+                             (dissoc :legacy-requests :request-cache))
               current {:request-id request-id :tx-root tx-root :epoch epoch}
               physical-root (ipld/put-node! put!
                                             (manifest-node next-state lsm-root current))
               record (assoc current :physical-root physical-root)
               final-state (-> next-state
                               (assoc :physical-root physical-root)
-                              (assoc-in [:snapshots epoch] physical-root)
-                              (assoc-in [:requests request-id] record))]
+                              (assoc :current-request record))]
           {:state final-state
            :receipt {:database-id database-id :epoch epoch
                      :request-id request-id :tx-root tx-root
@@ -297,20 +403,19 @@
                          :safe-epoch safe-epoch :basis-t basis :as-of as-of})))
       {:database-id (:database-id state) :basis-t as-of :runs (:runs state)
        :run-refs (:run-refs state)
-       :history (:history state) :history? (true? (:history selector))
-       :physical-root (get-in state [:snapshots as-of])}))
+       :history? (true? (:history selector))
+       :physical-root (:physical-root state)}))
 
-  (-scan [_ {:keys [runs run-refs basis-t history history?]} pattern _opts]
+  (-scan [_ {:keys [runs run-refs basis-t history?]} pattern _opts]
     (->> (if history?
-           (->> history (filter #(<= (:t %) basis-t))
-                canonical/canonical-datoms)
+           (history-rows runs basis-t)
            (if runs
              (logical-rows runs basis-t)
              (lazy-logical-rows get-fn run-refs basis-t pattern)))
          (filter #(matches? pattern %)) vec))
 
-  (-history [_ {:keys [history basis-t]} _opts]
-    (->> history (filter #(<= (:t %) basis-t)) canonical/canonical-datoms))
+  (-history [_ {:keys [runs basis-t]} _opts]
+    (history-rows runs basis-t))
 
   (-checkpoint [this {:keys [database-id basis-t runs run-refs physical-root]}
                 _opts]
@@ -345,18 +450,10 @@
                           (:safe-epoch state 0) (:target-run-rows engine)
                           (:l0-compaction-threshold engine) current-levels)
           compacted-runs (flatten-levels compacted-levels)
-          lsm-manifest (lsm/build-manifest
-                        {:db-id (:database-id state)
-                         :epoch (:basis-t state)
-                         :safe-epoch (:safe-epoch state 0)
-                         :previous (:lsm-root state)
-                         :indexes (level-refs-of compacted-levels)})
-          _ (persist-effects! (:put! engine) (:effects lsm-manifest))
-          lsm-root (:cid lsm-manifest)
-          current (some (fn [[request-id record]]
-                          (when (= (:basis-t state) (:epoch record))
-                            (assoc record :request-id request-id)))
-                        (:requests state))
+          lsm-root (put-lsm-manifest!
+                    (:put! engine) (:database-id state) (:basis-t state)
+                    (:safe-epoch state 0) (level-refs-of compacted-levels))
+          current (:current-request state)
           next-state (assoc state
                             :levels compacted-levels
                             :level-refs (level-refs-of compacted-levels)
@@ -370,12 +467,10 @@
                          (:put! engine)
                          (manifest-node next-state lsm-root current))
           final-state (cond-> (-> next-state
-                                  (assoc :physical-root physical-root)
-                                  (assoc-in [:snapshots (:basis-t state)]
-                                            physical-root))
+                                  (assoc :physical-root physical-root))
                         current
-                        (assoc-in [:requests (:request-id current) :physical-root]
-                                  physical-root))]
+                        (assoc :current-request
+                               (assoc current :physical-root physical-root)))]
       {:state final-state :compacted? true
        :previous-root (:physical-root state)
        :physical-root physical-root})))

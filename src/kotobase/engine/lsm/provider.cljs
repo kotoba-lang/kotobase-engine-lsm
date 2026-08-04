@@ -72,6 +72,9 @@
 (defn- all-run-refs [state]
   (vec (mapcat val (:run-refs state))))
 
+(defn- request-run-refs [state request-id]
+  (lsm/request-run-refs state request-id))
+
 (defn restore-head [eng backend ref-name]
   (storage/validate-backend! backend)
   (-> (storage/-read-ref backend ref-name)
@@ -92,10 +95,36 @@
 
 (defn scan! [eng snapshot pattern opts]
   (if (:history? snapshot)
-    (js/Promise.resolve (engine/scan eng snapshot pattern opts))
+    (let [refs (get (:run-refs snapshot) :eavt [])]
+      (-> (hydrate-run-refs! eng refs)
+          (.then
+           (fn [_]
+             (engine/scan eng
+                          (assoc snapshot :runs
+                                 {:eavt (mapv #(lsm/load-run-cached eng %) refs)})
+                          pattern opts)))))
     (let [[_ refs] (lsm/scan-run-refs (:run-refs snapshot) pattern)]
       (-> (hydrate-run-refs! eng refs)
           (.then (fn [_] (engine/scan eng snapshot pattern opts)))))))
+
+(defn history! [eng snapshot opts]
+  (let [refs (get (:run-refs snapshot) :eavt [])]
+    (-> (hydrate-run-refs! eng refs)
+        (.then
+         (fn [_]
+           (engine/history eng
+                           (assoc snapshot :runs
+                                  {:eavt (mapv #(lsm/load-run-cached eng %) refs)})
+                           opts))))))
+
+(defn request-records! [eng state]
+  (let [refs (get (:run-refs state) :request [])]
+    (-> (hydrate-run-refs! eng refs)
+        (.then
+         (fn [_]
+           (lsm/request-records
+            eng (assoc state :runs
+                       {:request (mapv #(lsm/load-run-cached eng %) refs)})))))))
 
 (defn checkpoint! [eng snapshot opts]
   (-> (hydrate-run-refs! eng (all-run-refs snapshot))
@@ -113,8 +142,11 @@
 
 (defn transact-and-publish! [eng backend ref-name state request]
   (storage/validate-backend! backend)
-  (let [expected (:physical-root state)]
-    (-> (hydrate-run-refs! eng (all-run-refs state))
+  (let [expected (:physical-root state)
+        refs (if (:inline-compaction? eng)
+               (all-run-refs state)
+               (request-run-refs state (:request-id request)))]
+    (-> (hydrate-run-refs! eng refs)
         (.then (fn [_] (engine/transact eng state request)))
         (.then
          (fn [result]

@@ -37,26 +37,37 @@
 (defn- run-ref-of [run]
   (or (:ref run) (lsm/run-ref run)))
 
-(defn- run-refs [runs]
+(defn- level-refs-of [levels-by-index]
   (into {}
-        (map (fn [[index values]]
-               [index {:l0 (mapv run-ref-of values)}]))
-        runs))
+        (map (fn [[index levels]]
+               [index (into {}
+                            (map (fn [[level values]]
+                                   [level (mapv run-ref-of values)]))
+                            levels)]))
+        levels-by-index))
 
-(defn- compact-runs-if-needed
-  "Bound L0 fan-in while retaining every version required at SAFE-EPOCH."
-  [put! database-id safe-epoch target-run-rows threshold runs]
+(defn- flatten-levels [levels-by-index]
   (into {}
-        (map (fn [[index values]]
-               (if (< (count values) threshold)
-                 [index values]
-                 (let [compacted (lsm/compact-runs-partitioned
-                                  index database-id safe-epoch
-                                  target-run-rows values)]
-                   (doseq [run compacted]
+        (map (fn [[index levels]]
+               [index (vec (mapcat val (sort-by key levels)))]))
+        levels-by-index))
+
+(defn- compact-levels-if-needed
+  "Move due L0 runs into overlapping L1 ranges without rewriting untouched L1."
+  [put! database-id safe-epoch target-run-rows threshold levels-by-index]
+  (into {}
+        (map (fn [[index levels]]
+               (let [l0 (vec (:l0 levels))
+                     l1 (vec (:l1 levels))]
+                 (if (< (count l0) threshold)
+                   [index levels]
+                   (let [result (compaction/compact-with-level
+                                 index database-id safe-epoch target-run-rows
+                                 l0 l1)]
+                     (doseq [run (:compacted result)]
                      (persist-effects! put! (:effects run)))
-                   [index compacted]))))
-        runs))
+                     [index (assoc levels :l0 [] :l1 (:all-output result))])))))
+        levels-by-index))
 
 (defn- manifest-node [state lsm-root current-request]
   {"engine" "kotobase-engine-lsm"
@@ -85,18 +96,25 @@
      :index (keyword (get node "index"))
      :count (get node "count")}))
 
-(defn- manifest-run-refs [manifest]
+(defn- manifest-level-refs [manifest]
   (into {}
         (keep (fn [[index levels]]
-                (let [refs (vec (mapcat val levels))]
+                (let [refs (into {}
+                                 (keep (fn [[level values]]
+                                         (when (seq values)
+                                           [(keyword level) (vec values)])))
+                                 levels)]
                   (when (seq refs) [(keyword index) refs]))))
         (get manifest "indexes")))
 
-(defn- load-run-refs [get-fn refs-by-index]
+(defn- load-level-refs [get-fn level-refs]
   (into {}
-        (map (fn [[index refs]]
-               [index (mapv #(load-run get-fn %) refs)]))
-        refs-by-index))
+        (map (fn [[index levels]]
+               [index (into {}
+                            (map (fn [[level refs]]
+                                   [level (mapv #(load-run get-fn %) refs)]))
+                            levels)]))
+        level-refs))
 
 (defn- ordered->eav [index components]
   (case index
@@ -160,12 +178,13 @@
     (max current candidate)))
 
 (defrecord MerkleLsmEngine [put! get-fn digest-fn target-run-rows
-                            l0-compaction-threshold reader-pins-fn]
+                            l0-compaction-threshold reader-pins-fn
+                            inline-compaction?]
   contract/IEngine
   (-engine-profile [_] lsm-profile)
   (-empty-state [_ {:keys [database-id]}]
-    {:database-id database-id :basis-t 0 :safe-epoch 0
-     :runs {} :run-refs {} :history []
+     {:database-id database-id :basis-t 0 :safe-epoch 0
+     :levels {} :level-refs {} :runs {} :run-refs {} :history []
      :requests {} :snapshots {}})
 
   (-restore-state [_ physical-root opts]
@@ -177,14 +196,17 @@
           basis-t (get node "basis-t")
           lsm-root (ipld/link-cid (get node "lsm-manifest"))
           lsm-manifest (ipld/decode (get-fn lsm-root))
-          refs-by-index (manifest-run-refs lsm-manifest)
+          level-refs (manifest-level-refs lsm-manifest)
+          refs-by-index (flatten-levels level-refs)
+          levels (when-not (:lazy? opts) (load-level-refs get-fn level-refs))
           current (read-field node "current-request-edn")
           requests (cond-> (read-field node "requests-edn")
                      current (assoc (:request-id current)
                                     (assoc current :physical-root physical-root)))]
       {:database-id (get node "database-id") :basis-t basis-t
        :safe-epoch (get node "safe-epoch" 0)
-       :runs (when-not (:lazy? opts) (load-run-refs get-fn refs-by-index))
+       :levels levels :level-refs level-refs
+       :runs (when levels (flatten-levels levels))
        :run-refs refs-by-index :lsm-root lsm-root
        :history (read-field node "history-edn") :requests requests
        :snapshots (assoc (read-field node "snapshots-edn") basis-t physical-root)
@@ -207,22 +229,32 @@
                           {:type :kotobase.engine/idempotency-conflict})))
         (let [epoch (inc (:basis-t state))
               safe-epoch (next-safe-epoch reader-pins-fn state epoch)
-              current-runs (or (:runs state)
-                               (load-run-refs get-fn (:run-refs state)))
+              current-levels (or (:levels state)
+                                 (when (:runs state)
+                                   (into {} (map (fn [[index runs]]
+                                                   [index {:l0 runs}]))
+                                         (:runs state)))
+                                 (load-level-refs get-fn (:level-refs state)))
               new-runs (lsm/build-index-run-ranges
                         database-id epoch target-run-rows
                         (mapv encode-datom tx))
               _ (doseq [runs (vals new-runs) run runs]
                   (persist-effects! put! (:effects run)))
-              all-runs (compact-runs-if-needed
-                        put! database-id safe-epoch target-run-rows
-                        l0-compaction-threshold
-                        (merge-with into current-runs new-runs))
+              appended-levels
+              (reduce-kv (fn [levels index runs]
+                           (update-in levels [index :l0] (fnil into []) runs))
+                         current-levels new-runs)
+              all-levels (if inline-compaction?
+                         (compact-levels-if-needed
+                          put! database-id safe-epoch target-run-rows
+                          l0-compaction-threshold appended-levels)
+                         appended-levels)
+              all-runs (flatten-levels all-levels)
               lsm-manifest (lsm/build-manifest
                             {:db-id database-id :epoch epoch
                              :safe-epoch safe-epoch
                              :previous (:lsm-root state)
-                             :indexes (run-refs all-runs)})
+                             :indexes (level-refs-of all-levels)})
               _ (persist-effects! put! (:effects lsm-manifest))
               lsm-root (:cid lsm-manifest)
               appended (mapv (fn [{:keys [e a v op]}]
@@ -230,6 +262,8 @@
                                 :added (= :assert op)}) tx)
               next-state (-> state (assoc :basis-t epoch
                                           :safe-epoch safe-epoch
+                                          :levels all-levels
+                                          :level-refs (level-refs-of all-levels)
                                           :runs all-runs
                                           :run-refs
                                           (into {}
@@ -288,11 +322,69 @@
        (digest this (canonical/checkpoint-datoms rows))
        :physical-root physical-root :engine lsm-profile})))
 
+(defn compaction-due?
+  "True when at least one index has reached ENGINE's L0 threshold."
+  [engine state]
+  (let [levels (or (:levels state) (:level-refs state))]
+    (some #(>= (count (:l0 %)) (:l0-compaction-threshold engine))
+          (vals levels))))
+
+(defn compact-state
+  "Compact a due L0 set without advancing the logical epoch.
+
+  The returned physical root is a maintenance candidate. Hosts must publish it
+  with CAS against the input state's physical root, just like a transaction."
+  [engine state]
+  (if-not (compaction-due? engine state)
+    {:state state :compacted? false}
+    (let [current-levels (or (:levels state)
+                             (load-level-refs (:get-fn engine)
+                                              (:level-refs state)))
+          compacted-levels (compact-levels-if-needed
+                          (:put! engine) (:database-id state)
+                          (:safe-epoch state 0) (:target-run-rows engine)
+                          (:l0-compaction-threshold engine) current-levels)
+          compacted-runs (flatten-levels compacted-levels)
+          lsm-manifest (lsm/build-manifest
+                        {:db-id (:database-id state)
+                         :epoch (:basis-t state)
+                         :safe-epoch (:safe-epoch state 0)
+                         :previous (:lsm-root state)
+                         :indexes (level-refs-of compacted-levels)})
+          _ (persist-effects! (:put! engine) (:effects lsm-manifest))
+          lsm-root (:cid lsm-manifest)
+          current (some (fn [[request-id record]]
+                          (when (= (:basis-t state) (:epoch record))
+                            (assoc record :request-id request-id)))
+                        (:requests state))
+          next-state (assoc state
+                            :levels compacted-levels
+                            :level-refs (level-refs-of compacted-levels)
+                            :runs compacted-runs
+                            :run-refs (into {}
+                                            (map (fn [[index values]]
+                                                   [index (mapv run-ref-of values)]))
+                                            compacted-runs)
+                            :lsm-root lsm-root)
+          physical-root (ipld/put-node!
+                         (:put! engine)
+                         (manifest-node next-state lsm-root current))
+          final-state (cond-> (-> next-state
+                                  (assoc :physical-root physical-root)
+                                  (assoc-in [:snapshots (:basis-t state)]
+                                            physical-root))
+                        current
+                        (assoc-in [:requests (:request-id current) :physical-root]
+                                  physical-root))]
+      {:state final-state :compacted? true
+       :previous-root (:physical-root state)
+       :physical-root physical-root})))
+
 (defn lsm-engine
   [{:keys [put! get-fn digest-fn target-run-rows l0-compaction-threshold
-           reader-pins-fn]
+           reader-pins-fn inline-compaction?]
     :or {target-run-rows 4096 l0-compaction-threshold 8
-         reader-pins-fn (constantly [])}}]
+         reader-pins-fn (constantly []) inline-compaction? true}}]
   (doseq [[capability value] [[:put! put!] [:get-fn get-fn]
                               [:digest-fn digest-fn]]]
     (when-not (ifn? value)
@@ -307,5 +399,10 @@
     (throw (ex-info "LSM engine reader-pins-fn must be callable"
                     {:type :kotobase.engine/missing-capability
                      :capability :reader-pins-fn})))
+  (when-not (boolean? inline-compaction?)
+    (throw (ex-info "LSM inline-compaction? must be boolean"
+                    {:type :kotobase.engine/invalid-inline-compaction
+                     :value inline-compaction?})))
   (->MerkleLsmEngine put! get-fn digest-fn target-run-rows
-                     l0-compaction-threshold reader-pins-fn))
+                     l0-compaction-threshold reader-pins-fn
+                     inline-compaction?))

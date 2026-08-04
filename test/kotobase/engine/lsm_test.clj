@@ -79,6 +79,87 @@
                           [nil nil nil]))
           "safe epoch zero preserves every historical snapshot"))))
 
+(deftest deferred-compaction-is-physical-only-maintenance
+  (let [candidate (:engine (fixture {:l0-compaction-threshold 2
+                                     :target-run-rows 64
+                                     :inline-compaction? false}))
+        database-id "lsm/deferred"
+        states (reductions
+                (fn [state epoch]
+                  (:state
+                   (engine/transact
+                    candidate state
+                    {:database-id database-id
+                     :request-id (str "d" epoch)
+                     :tx-data [[:db/add "counter" :value epoch]]})))
+                (engine/empty-state candidate database-id)
+                (range 1 5))
+        before (last states)
+        before-checkpoint (engine/checkpoint
+                           candidate (engine/open-snapshot candidate before))
+        result (lsm/compact-state candidate before)
+        after (:state result)
+        restored (engine/restore-state candidate (:physical-root after))]
+    (is (lsm/compaction-due? candidate before))
+    (is (some #(> (count %) 1) (vals (:runs before)))
+        "deferred writes leave compaction out of the transaction path")
+    (is (:compacted? result))
+    (is (= (:basis-t before) (:basis-t after))
+        "maintenance does not advance the logical epoch")
+    (is (not= (:physical-root before) (:physical-root after)))
+    (is (= (:logical-checkpoint-root before-checkpoint)
+           (:logical-checkpoint-root
+            (engine/checkpoint candidate
+                               (engine/open-snapshot candidate restored))))
+        "maintenance preserves the logical checkpoint")
+    (doseq [epoch (range 1 5)]
+      (is (= (engine/scan candidate
+                          (engine/open-snapshot candidate (nth states epoch)
+                                                {:as-of epoch})
+                          [nil nil nil])
+             (engine/scan candidate
+                          (engine/open-snapshot candidate restored
+                                                {:as-of epoch})
+                          [nil nil nil]))))
+    (is (= :replayed
+           (get-in (engine/transact
+                    candidate restored
+                    {:database-id database-id :request-id "d4"
+                     :tx-data [[:db/add "counter" :value 4]]})
+                   [:receipt :status]))
+        "idempotency survives physical maintenance")))
+
+(deftest leveled-compaction-shares-non-overlapping-l1-runs
+  (let [candidate (:engine (fixture {:l0-compaction-threshold 2
+                                     :target-run-rows 64}))
+        database-id "lsm/leveled"
+        transact-one (fn [state n entity]
+                       (:state
+                        (engine/transact
+                         candidate state
+                         {:database-id database-id :request-id (str "l" n)
+                          :tx-data [[:db/add entity :value n]]})))
+        s0 (engine/empty-state candidate database-id)
+        s1 (transact-one s0 1 "a")
+        s2 (transact-one s1 2 "b")
+        first-l1 (set (map :cid (get-in s2 [:levels :eavt :l1])))
+        s3 (transact-one s2 3 "y")
+        s4 (transact-one s3 4 "z")
+        second-l1 (set (map :cid (get-in s4 [:levels :eavt :l1])))
+        restored (engine/restore-state candidate (:physical-root s4))]
+    (is (seq first-l1))
+    (is (every? second-l1 first-l1)
+        "a disjoint L0 range does not rewrite existing L1 runs")
+    (is (= (into {} (map (fn [[index levels]] [index (:l1 levels)]))
+                         (:level-refs s4))
+           (into {} (map (fn [[index levels]] [index (:l1 levels)]))
+                 (:level-refs restored)))
+        "manifest restore preserves levels instead of flattening them")
+    (is (= (engine/scan candidate (engine/open-snapshot candidate s4)
+                        [nil nil nil])
+           (engine/scan candidate (engine/open-snapshot candidate restored)
+                        [nil nil nil])))))
+
 (deftest reader-pins-advance-and-persist-safe-epoch
   (let [pins (atom [])
         candidate (:engine

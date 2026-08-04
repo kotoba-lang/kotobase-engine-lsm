@@ -1,5 +1,6 @@
 (ns run
   (:require [kotobase.engine.contract :as engine]
+            [kotobase.engine.lsm :as lsm]
             [kotobase.engine.lsm.provider :as provider]
             [kotobase.storage.core :as storage]))
 
@@ -34,6 +35,47 @@
   {:digest-fn #(str "digest:" (hash %))
    :target-run-rows 8
    :l0-compaction-threshold 1000})
+
+(def maintenance-options
+  (assoc options :l0-compaction-threshold 2 :inline-compaction? false))
+
+(defn- verify-maintenance! []
+  (let [backend (->AsyncStore (atom {}) (atom {}))
+        writer (provider/engine-from-backend backend maintenance-options)
+        database-id "lsm/cljs-maintenance"
+        request (fn [n]
+                  {:database-id database-id :request-id (str "m" n)
+                   :tx-data [[:db/add "counter" :value n]]})]
+    (-> (provider/transact-and-publish!
+         writer backend "main" (engine/empty-state writer database-id)
+         (request 1))
+        (.then (fn [r1]
+                 (provider/transact-and-publish!
+                  writer backend "main" (:state r1) (request 2))))
+        (.then
+         (fn [r2]
+           (let [before (:state r2)
+                 epoch (:basis-t before)
+                 loser (provider/engine-from-backend backend maintenance-options)]
+             (check (lsm/compaction-due? writer before)
+                    "deferred LSM maintenance becomes due")
+             (-> (provider/restore-head loser backend "main")
+                 (.then
+                  (fn [stale]
+                    (-> (provider/compact-and-publish!
+                         writer backend "main" before)
+                        (.then
+                         (fn [maintained]
+                           (check (= :published (:publish-status maintained))
+                                  "physical-only maintenance publishes with CAS")
+                           (check (= epoch (get-in maintained [:state :basis-t]))
+                                  "physical-only maintenance preserves epoch")
+                           (-> (provider/compact-and-publish!
+                                loser backend "main" stale)
+                               (.then
+                                (fn [conflict]
+                                  (check (= :conflict (:publish-status conflict))
+                                         "stale maintenance loses head CAS"))))))))))))))))
 
 (defn- cold-write! [backend database-id]
   (let [writer (provider/engine-from-backend backend options)]
@@ -127,7 +169,8 @@
         (.then (fn [published]
                  (check (= :published (:publish-status published))
                         "immutable LSM blocks publish before CAS")
-                 (verify-reader! backend database-id)))
+                 (-> (verify-reader! backend database-id)
+                     (.then (fn [_] (verify-maintenance!))))))
         (.then (fn [_] (println "kotobase-engine-lsm cljs: all green")))
         (.catch (fn [error]
                   (js/console.error error)

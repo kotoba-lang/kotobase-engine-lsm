@@ -134,3 +134,31 @@
                               :expected-root expected
                               :candidate-root next-root
                               :winner-root (:current publication)})))))))))))))
+
+(defn compact-and-publish!
+  "Run physical-only L0 maintenance and publish it with head CAS."
+  [eng backend ref-name state]
+  (storage/validate-backend! backend)
+  (let [expected (:physical-root state)]
+    (-> (hydrate-run-refs! eng (all-run-refs state))
+        (.then (fn [_] (lsm/compact-state eng state)))
+        (.then
+         (fn [result]
+           (if-not (:compacted? result)
+             (assoc result :publish-status :not-due)
+             (-> (flush-pending! eng)
+                 (.then
+                  (fn [_]
+                    (let [next-root (:physical-root result)]
+                      (-> (storage/-compare-and-set-ref!
+                           backend ref-name expected next-root)
+                          (.then
+                           (fn [publication]
+                             (if (:published? publication)
+                               (assoc result :publication publication
+                                      :publish-status :published)
+                               (assoc result :publication publication
+                                      :publish-status :conflict
+                                      :expected-root expected
+                                      :candidate-root next-root
+                                      :winner-root (:current publication))))))))))))))))

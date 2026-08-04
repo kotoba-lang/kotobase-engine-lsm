@@ -79,6 +79,32 @@
                           [nil nil nil]))
           "safe epoch zero preserves every historical snapshot"))))
 
+(deftest physical-maintenance-is-not-a-checkpoint-alias
+  (let [candidate (:engine (fixture {:l0-compaction-threshold 1000
+                                     :target-run-rows 64}))
+        database-id "lsm/maintenance"
+        before (reduce
+                (fn [state epoch]
+                  (:state (engine/transact
+                           candidate state
+                           {:database-id database-id
+                            :request-id (str "m" epoch)
+                            :tx-data [[:db/add "counter" :value epoch]]})))
+                (engine/empty-state candidate database-id)
+                (range 1 4))
+        before-rows (engine/scan candidate (engine/open-snapshot candidate before)
+                                 [nil nil nil])
+        result (engine/maintain candidate before)
+        after (:state result)
+        restored (engine/restore-state candidate (:physical-root after))]
+    (is (= :completed (get-in result [:receipt :status])))
+    (is (pos? (get-in result [:receipt :work-units])))
+    (is (not= (:physical-root before) (:physical-root after)))
+    (is (= (:basis-t before) (:basis-t after)) "maintenance is not a transaction")
+    (is (= before-rows
+           (engine/scan candidate (engine/open-snapshot candidate restored)
+                        [nil nil nil])))))
+
 (deftest reader-pins-advance-and-persist-safe-epoch
   (let [pins (atom [])
         candidate (:engine

@@ -91,6 +91,26 @@
            (check (= "content-addressed block CID mismatch" (.-message error))
                   "corrupted object-store block fails closed"))))))
 
+(defn- verify-maintenance! [backend]
+  (let [maintainer (provider/engine-from-backend backend options)]
+    (-> (provider/restore-head maintainer backend "main")
+        (.then
+         (fn [state]
+           (provider/maintain-and-publish! maintainer backend "main" state {})))
+        (.then
+         (fn [result]
+           (check (= :published (:publish-status result))
+                  "physical maintenance publishes by CAS")
+           (check (= :completed (get-in result [:receipt :status]))
+                  "maintenance is real compaction, not checkpoint")
+           (let [reader (provider/engine-from-backend backend options)]
+             (-> (provider/restore-head reader backend "main")
+                 (.then
+                  (fn [restored]
+                    (check (= (get-in result [:receipt :after-physical-root])
+                              (:physical-root restored))
+                           "published maintenance root restores"))))))))))
+
 (defn- verify-reader! [backend database-id]
   (let [reader (provider/engine-from-backend backend options)
         stored-blocks (count @(:blocks backend))]
@@ -112,6 +132,7 @@
                          " stored-blocks=" stored-blocks)))
            (-> (cold-write! backend database-id)
                (.then (fn [_] (verify-conflict! backend database-id)))
+               (.then (fn [_] (verify-maintenance! backend)))
                (.then (fn [_] (verify-corruption-rejected! backend)))))))))
 
 (defn main []

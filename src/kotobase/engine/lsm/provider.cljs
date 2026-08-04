@@ -101,6 +101,34 @@
   (-> (hydrate-run-refs! eng (all-run-refs snapshot))
       (.then (fn [_] (engine/checkpoint eng snapshot opts)))))
 
+(declare flush-pending!)
+
+(defn maintain-and-publish! [eng backend ref-name state opts]
+  (storage/validate-backend! backend)
+  (let [expected (:physical-root state)]
+    (-> (hydrate-run-refs! eng (all-run-refs state))
+        (.then (fn [_] (engine/maintain eng state opts)))
+        (.then
+         (fn [result]
+           (-> (flush-pending! eng)
+               (.then
+                (fn [_]
+                  (let [next-root (get-in result [:receipt :after-physical-root])]
+                    (if (= expected next-root)
+                      (assoc result :publish-status :noop)
+                      (-> (storage/-compare-and-set-ref!
+                           backend ref-name expected next-root)
+                          (.then
+                           (fn [publication]
+                             (if (:published? publication)
+                               (assoc result :publication publication
+                                      :publish-status :published)
+                               {:publish-status :conflict
+                                :publication publication
+                                :expected-root expected
+                                :candidate-root next-root
+                                :winner-root (:current publication)}))))))))))))))
+
 (defn- flush-pending! [eng]
   (let [{:keys [backend pending]} (runtime-of eng)
         blocks (mapv (fn [[cid bytes]] {:cid cid :bytes bytes}) @pending)]

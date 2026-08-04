@@ -14,7 +14,7 @@
   (-> profile/merkle-lsm
       (assoc :engine/implementation :kotobase.engine/lsm)
       (update :engine/capabilities conj :typed-edn :durable-manifest
-              :append-only-runs)))
+              :append-only-runs :physical-maintenance)))
 
 (defn- digest [engine value]
   ((:digest-fn engine) (canonical/canonical-string value)))
@@ -57,6 +57,21 @@
                      (persist-effects! put! (:effects run)))
                    [index compacted]))))
         runs))
+
+(defn- maintain-runs
+  "Force one physical compaction pass without inventing a transaction epoch."
+  [put! database-id safe-epoch target-run-rows runs]
+  (reduce-kv
+   (fn [{:keys [runs work-units]} index values]
+     (if (<= (count values) 1)
+       {:runs (assoc runs index values) :work-units work-units}
+       (let [compacted (lsm/compact-runs-partitioned
+                        index database-id safe-epoch target-run-rows values)]
+         (doseq [run compacted] (persist-effects! put! (:effects run)))
+         {:runs (assoc runs index compacted)
+          :work-units (+ work-units (count values))})))
+   {:runs {} :work-units 0}
+   runs))
 
 (defn- manifest-node [state lsm-root current-request]
   {"engine" "kotobase-engine-lsm"
@@ -286,7 +301,44 @@
       {:database-id database-id :epoch basis-t
        :logical-checkpoint-root
        (digest this (canonical/checkpoint-datoms rows))
-       :physical-root physical-root :engine lsm-profile})))
+       :physical-root physical-root :engine lsm-profile}))
+
+  contract/IMaintenance
+  (-maintain [_ state _opts]
+    (let [before (:physical-root state)
+          _ (when-not (contract/nonblank-string? before)
+              (throw (ex-info "maintenance requires a published physical root"
+                              {:type :kotobase.engine/invalid-maintenance-state})))
+          current-runs (or (:runs state)
+                           (load-run-refs get-fn (:run-refs state)))
+          {:keys [runs work-units]}
+          (maintain-runs put! (:database-id state) (:safe-epoch state 0)
+                         target-run-rows current-runs)]
+      (if (zero? work-units)
+        {:state state
+         :receipt {:database-id (:database-id state)
+                   :before-physical-root before :after-physical-root before
+                   :work-units 0 :status :noop :engine lsm-profile}}
+        (let [lsm-manifest (lsm/build-manifest
+                            {:db-id (:database-id state) :epoch (:basis-t state)
+                             :safe-epoch (:safe-epoch state 0)
+                             :previous (:lsm-root state)
+                             :indexes (run-refs runs)})
+              _ (persist-effects! put! (:effects lsm-manifest))
+              lsm-root (:cid lsm-manifest)
+              next-state (assoc state :runs runs :run-refs (run-refs runs)
+                                :lsm-root lsm-root)
+              physical-root (ipld/put-node!
+                             put! (manifest-node next-state lsm-root nil))
+              final-state (-> next-state
+                              (assoc :physical-root physical-root)
+                              (assoc-in [:snapshots (:basis-t state)] physical-root))]
+          {:state final-state
+           :receipt {:database-id (:database-id state)
+                     :before-physical-root before
+                     :after-physical-root physical-root
+                     :work-units work-units :status :completed
+                     :engine lsm-profile}})))))
 
 (defn lsm-engine
   [{:keys [put! get-fn digest-fn target-run-rows l0-compaction-threshold

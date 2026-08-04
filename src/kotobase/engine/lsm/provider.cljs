@@ -139,9 +139,12 @@
   "Run physical-only L0 maintenance and publish it with head CAS."
   [eng backend ref-name state]
   (storage/validate-backend! backend)
-  (let [expected (:physical-root state)]
-    (-> (hydrate-run-refs! eng (all-run-refs state))
-        (.then (fn [_] (lsm/compact-state eng state)))
+  (if-not (lsm/compaction-due? eng state)
+    (js/Promise.resolve {:state state :compacted? false
+                         :publish-status :not-due})
+    (let [expected (:physical-root state)]
+      (-> (hydrate-run-refs! eng (all-run-refs state))
+          (.then (fn [_] (lsm/compact-state eng state)))
         (.then
          (fn [result]
            (if-not (:compacted? result)
@@ -161,4 +164,4 @@
                                       :publish-status :conflict
                                       :expected-root expected
                                       :candidate-root next-root
-                                      :winner-root (:current publication))))))))))))))))
+                                      :winner-root (:current publication)))))))))))))))))

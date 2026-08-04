@@ -77,6 +77,18 @@
                                   (check (= :conflict (:publish-status conflict))
                                          "stale maintenance loses head CAS"))))))))))))))))
 
+(defn- verify-not-due-maintenance-does-no-io! []
+  (let [backend (->AsyncStore (atom {}) (atom {}))
+        writer (provider/engine-from-backend backend maintenance-options)
+        state (engine/empty-state writer "lsm/not-due")]
+    (-> (provider/compact-and-publish! writer backend "main" state)
+        (.then
+         (fn [result]
+           (check (= :not-due (:publish-status result))
+                  "not-due maintenance returns without publication")
+           (check (zero? (provider/request-count writer))
+                  "not-due maintenance performs no backend reads"))))))
+
 (defn- cold-write! [backend database-id]
   (let [writer (provider/engine-from-backend backend options)]
     (-> (provider/restore-head writer backend "main")
@@ -170,7 +182,8 @@
                  (check (= :published (:publish-status published))
                         "immutable LSM blocks publish before CAS")
                  (-> (verify-reader! backend database-id)
-                     (.then (fn [_] (verify-maintenance!))))))
+                     (.then (fn [_] (verify-maintenance!)))
+                     (.then (fn [_] (verify-not-due-maintenance-does-no-io!))))))
         (.then (fn [_] (println "kotobase-engine-lsm cljs: all green")))
         (.catch (fn [error]
                   (js/console.error error)

@@ -126,6 +126,11 @@
             eng (assoc state :runs
                        {:request (mapv #(lsm/load-run-cached eng %) refs)})))))))
 
+(defn request-record! [eng state request-id]
+  (let [refs (request-run-refs state request-id)]
+    (-> (hydrate-run-refs! eng refs)
+        (.then (fn [_] (lsm/request-record eng state request-id))))))
+
 (defn checkpoint! [eng snapshot opts]
   (-> (hydrate-run-refs! eng (all-run-refs snapshot))
       (.then (fn [_] (engine/checkpoint eng snapshot opts)))))

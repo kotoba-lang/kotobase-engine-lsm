@@ -1,6 +1,7 @@
 (ns kotobase.engine.lsm.provider
   "Asynchronous block/ref coordinator for Worker and R2-style hosts."
   (:require [ipld.core :as ipld]
+            [kotobase.blockcodec.node :as bcn]
             [kotobase.engine.contract :as engine]
             [kotobase.engine.lsm :as lsm]
             [kotobase.storage.core :as storage]))
@@ -65,7 +66,7 @@
            (let [cache (:cache (runtime-of eng))
                  children (mapcat (fn [cid]
                                     (lsm/run-node-child-cids
-                                     (ipld/decode (get @cache cid))))
+                                     (bcn/decode-node (get @cache cid))))
                                   cids)]
              (fetch-cids! eng children)))))))
 
@@ -83,7 +84,7 @@
                  (.then
                   (fn [_]
                     (let [cache (:cache (runtime-of eng))
-                          node (ipld/decode (get @cache cid))
+                          node (bcn/decode-node (get @cache cid))
                           lsm-cid (ipld/link-cid (get node "lsm-manifest"))]
                       (-> (fetch-cids! eng [lsm-cid])
                           (.then (fn [_]

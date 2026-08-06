@@ -4,7 +4,8 @@
             [kotobase.engine.conformance :as conformance]
             [kotobase.engine.contract :as engine]
             [kotobase.engine.lsm :as lsm]
-            [kotobase.engine.memory :as memory]))
+            [kotobase.engine.memory :as memory]
+            [kotobase.blockcodec.node :as bcn]))
 
 (def digest-fn #(str "digest:" (hash %)))
 
@@ -187,3 +188,43 @@
                                  (engine/open-snapshot reader cold-next)
                                  ["entity-101" :value nil])))
         "a lazy state can hydrate for a mixed cold transaction")))
+
+;; ---------------------------------------------------------------------------
+;; ADR-2608060500 phase 1: this engine can READ a compressed block
+;; ---------------------------------------------------------------------------
+;;
+;; merkle-lsm does not write them yet, and must not until every reader can
+;; handle them — producer and readers here are separate artifacts on separate
+;; deploy cycles, so a writer-first flip is an outage, not a migration.
+
+(deftest reads-blocks-stored-in-the-compressed-representation
+  (let [{:keys [blocks engine]} (fixture)
+        database-id "lsm/compressed"
+        ;; enough rows that the canonical keys have something to repeat
+        state (reduce (fn [st i]
+                        (:state (engine/transact
+                                 engine st
+                                 {:database-id database-id :request-id (str "z" i)
+                                  :tx-data [[:db/add (str "entity-" (mod i 20)) :value
+                                             {:n i :note "lorem ipsum dolor sit amet"}]]})))
+                      (engine/empty-state engine database-id)
+                      (range 40))
+        before (engine/scan engine (engine/open-snapshot engine state) [nil nil nil])]
+
+    ;; Re-encode every stored block through the envelope, in place. The CIDs
+    ;; deliberately keep addressing the same logical nodes: a real compressed
+    ;; store re-addresses everything, which cannot happen before the writer
+    ;; flips. This isolates the one thing that has to be true first — that the
+    ;; read path understands an envelope when it meets one.
+    (swap! blocks (fn [m]
+                    (into {} (map (fn [[cid bytes]]
+                                    [cid (bcn/encode-node (ipld/decode bytes))]))
+                          m)))
+
+    (is (some #(bcn/envelope? (ipld/decode %)) (vals @blocks))
+        "the fixture must actually contain a compressed block, or this proves nothing")
+
+    (let [restored (engine/restore-state engine (:physical-root state))]
+      (is (= before (engine/scan engine (engine/open-snapshot engine restored)
+                                 [nil nil nil]))
+          "same rows, read back out of compressed blocks"))))

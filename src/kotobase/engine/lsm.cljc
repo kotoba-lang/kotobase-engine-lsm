@@ -2,6 +2,7 @@
   "Datomic-shaped engine over immutable Merkle-LSM runs."
   (:require [clojure.edn :as edn]
             [ipld.core :as ipld]
+            [kotobase.blockcodec.node :as bcn]
             [kotobase.engine.canonical :as canonical]
             [kotobase.engine.contract :as contract]
             [kotobase.engine.profile :as profile]
@@ -90,11 +91,11 @@
 
 (defn- load-run [get-fn ref]
   (let [cid (ipld/link-cid (get ref "cid"))
-        node (ipld/decode (get-fn cid))
+        node (bcn/decode-node (get-fn cid))
         rows (or (get node "rows")
                  (mapcat (fn [descriptor]
                            (let [block-cid (ipld/link-cid (get descriptor "cid"))]
-                             (get (ipld/decode (get-fn block-cid)) "rows")))
+                             (get (bcn/decode-node (get-fn block-cid)) "rows")))
                          (get node "blocks")))]
     {:cid cid :node node :rows (vec rows) :ref ref
      :index (keyword (get node "index"))
@@ -184,14 +185,14 @@
      :requests {} :snapshots {}})
 
   (-restore-state [_ physical-root opts]
-    (let [node (ipld/decode (get-fn physical-root))
+    (let [node (bcn/decode-node (get-fn physical-root))
           _ (when-not (and (= "kotobase-engine-lsm" (get node "engine"))
                            (= engine-format-version (get node "format-version")))
               (throw (ex-info "unsupported LSM engine manifest"
                               {:type :kotobase.engine/unsupported-manifest})))
           basis-t (get node "basis-t")
           lsm-root (ipld/link-cid (get node "lsm-manifest"))
-          lsm-manifest (ipld/decode (get-fn lsm-root))
+          lsm-manifest (bcn/decode-node (get-fn lsm-root))
           refs-by-index (manifest-run-refs lsm-manifest)
           current (read-field node "current-request-edn")
           requests (cond-> (read-field node "requests-edn")

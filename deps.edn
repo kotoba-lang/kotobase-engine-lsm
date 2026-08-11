@@ -1,6 +1,6 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/kotobase-engine-contract
-        {:git/sha "e367ef3b1493ad74b20f41737d5afe0bf4eda44b"}
+        {:git/sha "0231255dd6b32c13696816865bbad94702315b5b"}
         ;; This engine requires ipld.core/value directly. Keep the runtime
         ;; portability boundary explicit instead of inheriting an arbitrary
         ;; transitive revision from an index implementation.

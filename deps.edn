@@ -11,7 +11,7 @@
         io.github.kotoba-lang/prolly-tree
         {:git/sha "7906ae8dd17ce349bd5696532df7ebaa1e2f1498"}
         io.github.kotoba-lang/kotobase-storage
-        {:git/sha "f41e7bd3dfc8547614c6adc843c9d5fd1290687f"}
+        {:git/sha "c17e99fa4e254685798c95dace4e277e59464915"}
         ;; Reader half of ADR-2608060500. `decode-node` is the identity on
         ;; every block written so far, so this changes no behaviour today —
         ;; it makes this engine able to read a compressed run block, which

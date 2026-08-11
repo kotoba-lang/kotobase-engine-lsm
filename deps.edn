@@ -1,6 +1,11 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/kotobase-engine-contract
-        {:git/sha "315660c5a6ba5ffd7adf2f8a2e6b298158c5f998"}
+        {:git/sha "e367ef3b1493ad74b20f41737d5afe0bf4eda44b"}
+        ;; This engine requires ipld.core/value directly. Keep the runtime
+        ;; portability boundary explicit instead of inheriting an arbitrary
+        ;; transitive revision from an index implementation.
+        io.github.kotoba-lang/io-ipld
+        {:git/sha "309db3f8a7d690ccd07abc69b1a37793955c6105"}
         io.github.kotoba-lang/merkle-lsm
         {:git/sha "202c365c86b6ac0d5e9a3329f6f05d5a076878b5"}
         io.github.kotoba-lang/prolly-tree

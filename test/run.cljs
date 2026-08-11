@@ -121,8 +121,10 @@
         (.then
          (fn [restored]
            (check (nil? (:runs restored)) "cold restore is manifest-only")
-           (check (= 2 (provider/request-count reader))
-                  "restore fetches two manifests")
+           (let [requests (provider/request-count reader)]
+             (check (= 3 requests)
+                    (str "restore fetches two manifests plus the current-request index"
+                         " (requests=" requests ")")))
            (provider/scan! reader (engine/open-snapshot reader restored)
                            ["entity-64" :metric/value nil] {})))
         (.then

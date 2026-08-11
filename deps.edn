@@ -1,6 +1,6 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/kotobase-engine-contract
-        {:git/sha "0231255dd6b32c13696816865bbad94702315b5b"}
+        {:git/sha "7aced98bbe1a3faa8324c8e9161a83db767068e4"}
         ;; This engine requires ipld.core/value directly. Keep the runtime
         ;; portability boundary explicit instead of inheriting an arbitrary
         ;; transitive revision from an index implementation.
@@ -11,7 +11,7 @@
         io.github.kotoba-lang/prolly-tree
         {:git/sha "7906ae8dd17ce349bd5696532df7ebaa1e2f1498"}
         io.github.kotoba-lang/kotobase-storage
-        {:git/sha "c17e99fa4e254685798c95dace4e277e59464915"}
+        {:git/sha "fce6991cd1f0ff028b234317f2fdb2cfbd7b56ac"}
         ;; Reader half of ADR-2608060500. `decode-node` is the identity on
         ;; every block written so far, so this changes no behaviour today —
         ;; it makes this engine able to read a compressed run block, which

@@ -6,6 +6,7 @@
             [kotobase.engine.contract :as engine]
             [kotobase.engine.lsm :as lsm]
             [kotobase.engine.memory :as memory]
+            [kotobase.engine.metadata :as metadata]
             [kotobase.blockcodec.node :as bcn]))
 
 (def digest-fn #(str "digest:" (hash %)))
@@ -22,7 +23,8 @@
               (merge {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
                       :get-fn #(get @blocks %)
                       :digest-fn digest-fn
-                      :encrypt-fn identity :decrypt-fn identity}
+                      :encrypt-fn identity :decrypt-fn identity
+                      :metadata-key-fn #(str "key:" (hash %))}
                      options))})))
 
 (deftest shared-conformance
@@ -56,7 +58,7 @@
             (engine/checkpoint candidate
                                (engine/open-snapshot candidate restored)))))))
 
-(deftest manifest-v2-is-bounded-and-carries-no-plaintext-metadata
+(deftest manifest-v3-is-bounded-and-carries-no-plaintext-metadata
   (let [{candidate :engine blocks :blocks}
         (fixture {:encrypt-fn reverse-bytes :decrypt-fn reverse-bytes})
         transact-one
@@ -74,15 +76,15 @@
         root2-bytes (get @blocks (:physical-root s2))
         root20-bytes (get @blocks (:physical-root s20))
         root20 (bcn/decode-node root20-bytes)
-        metadata-node (bcn/decode-node (get @blocks (:metadata-head s20)))]
-    (is (= 2 (get root20 "format-version")))
+        metadata-node (bcn/decode-node (get @blocks (:metadata-root s20)))]
+    (is (= 3 (get root20 "format-version")))
     (is (= #{"engine" "format-version" "database-id" "basis-t"
-             "safe-epoch" "lsm-manifest" "metadata-head"
-             "previous-manifest"}
+             "safe-epoch" "lsm-manifest" "metadata-format" "metadata-root"
+             "current-request-key" "previous-manifest"}
            (set (keys root20))))
     (is (<= (count root20-bytes) (+ 16 (count root2-bytes)))
         "root manifest size is independent of transaction history")
-    (is (= #{"format" "payload" "previous"} (set (keys metadata-node))))
+    (is (contains? #{"leaf" "internal"} (get metadata-node "kind")))
     (is (not-any? #(str/includes? (pr-str root20) %)
                   ["private-request" "secret-value" "history-edn"
                    "requests-edn" "snapshots-edn"]))))
@@ -219,6 +221,7 @@
                  :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
                  :digest-fn digest-fn
                  :encrypt-fn identity :decrypt-fn identity
+                 :metadata-key-fn #(str "key:" (hash %))
                  :target-run-rows 8
                  :l0-compaction-threshold 1000})
         restored (engine/restore-state reader (:physical-root seeded)
@@ -248,6 +251,104 @@
                                  (engine/open-snapshot reader cold-next)
                                  ["entity-101" :value nil])))
         "a lazy state can hydrate for a mixed cold transaction")))
+
+(deftest indexed-metadata-restore-and-old-replay-are-not-linear-in-history
+  (let [{writer :engine blocks :blocks}
+        (fixture {:target-run-rows 64 :l0-compaction-threshold 1000})
+        database-id "lsm/indexed-metadata"
+        first-state
+        (:state
+         (engine/transact
+          writer (engine/empty-state writer database-id)
+          {:database-id database-id :request-id "scale-1"
+           :tx-data [[:db/add "entity-1" :value 1]]}))
+        first-root (:physical-root first-state)
+        final-state
+        (reduce
+         (fn [state epoch]
+           (:state
+            (engine/transact
+             writer state
+             {:database-id database-id :request-id (str "scale-" epoch)
+              :tx-data [[:db/add (str "entity-" epoch) :value epoch]]})))
+         first-state
+         (range 2 33))
+        gets (atom 0)
+        reader (lsm/lsm-engine
+                {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                 :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+                 :digest-fn digest-fn
+                 :encrypt-fn identity :decrypt-fn identity
+                 :metadata-key-fn #(str "key:" (hash %))
+                 :target-run-rows 64 :l0-compaction-threshold 1000})
+        restored (engine/restore-state reader (:physical-root final-state)
+                                       {:lazy? true})
+        restore-gets @gets
+        replay (engine/transact
+                reader restored
+                {:database-id database-id :request-id "scale-1"
+                 :tx-data [[:db/add "entity-1" :value 1]]})
+        replay-gets (- @gets restore-gets)]
+    (is (nil? (:history restored)) "cold restore does not hydrate history")
+    (is (< restore-gets 10)
+        (str "32-epoch restore used " restore-gets " block reads"))
+    (is (= :replayed (get-in replay [:receipt :status])))
+    (is (= first-root (get-in replay [:receipt :physical-root])))
+    (is (< replay-gets 10)
+        (str "old request lookup used " replay-gets " block reads"))))
+
+(deftest format-v2-chain-migrates-to-v3-index-on-next-transaction
+  (let [{candidate :engine blocks :blocks} (fixture)
+        database-id "lsm/v2-migration"
+        r1 (engine/transact
+            candidate (engine/empty-state candidate database-id)
+            {:database-id database-id :request-id "old-1"
+             :tx-data [[:db/add "e1" :value 1]]})
+        s1 (:state r1)
+        r2 (engine/transact
+            candidate s1
+            {:database-id database-id :request-id "old-2"
+             :tx-data [[:db/add "e2" :value 2]]})
+        s2 (:state r2)
+        put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+        segment1
+        (metadata/persist-segment!
+         put! identity nil
+         {:epoch 1 :history (filterv #(= 1 (:t %)) (:history s2))
+          :request {:request-id "old-1" :tx-root (get-in r1 [:receipt :tx-root])}
+          :previous-physical-root nil :previous-transaction-root nil})
+        segment2
+        (metadata/persist-segment!
+         put! identity segment1
+         {:epoch 2 :history (filterv #(= 2 (:t %)) (:history s2))
+          :request {:request-id "old-2" :tx-root (get-in r2 [:receipt :tx-root])}
+          :previous-physical-root (:physical-root s1)
+          :previous-transaction-root (:physical-root s1)})
+        v2-root
+        (ipld/put-node!
+         put! {"engine" "kotobase-engine-lsm" "format-version" 2
+               "database-id" database-id "basis-t" 2 "safe-epoch" 0
+               "lsm-manifest" (ipld/link (:lsm-root s2))
+               "metadata-head" (ipld/link segment2)
+               "previous-manifest" (ipld/link (:physical-root s1))})
+        restored-v2 (engine/restore-state candidate v2-root)
+        migrated
+        (:state
+         (engine/transact
+          candidate restored-v2
+          {:database-id database-id :request-id "new-3"
+           :tx-data [[:db/add "e3" :value 3]]}))
+        restored-v3 (engine/restore-state candidate (:physical-root migrated)
+                                          {:lazy? true})
+        replay-old
+        (engine/transact
+         candidate restored-v3
+         {:database-id database-id :request-id "old-1"
+          :tx-data [[:db/add "e1" :value 1]]})]
+    (is (= 3 (get (ipld/decode (get @blocks (:physical-root migrated)))
+                  "format-version")))
+    (is (= :replayed (get-in replay-old [:receipt :status])))
+    (is (= (:physical-root s1) (get-in replay-old [:receipt :physical-root])))))
 
 ;; ---------------------------------------------------------------------------
 ;; ADR-2608060500 phase 1: this engine can READ a compressed block

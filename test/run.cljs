@@ -34,6 +34,7 @@
   {:digest-fn #(str "digest:" (hash %))
    :encrypt-fn #(js/Promise.resolve %)
    :decrypt-fn #(js/Promise.resolve %)
+   :metadata-key-fn #(js/Promise.resolve (str "key:" (hash %)))
    :target-run-rows 8
    :l0-compaction-threshold 1000})
 

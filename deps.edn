@@ -1,8 +1,10 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/kotobase-engine-contract
-        {:git/sha "16012e26b393979ecbcade006096c100fc80fb68"}
+        {:git/sha "315660c5a6ba5ffd7adf2f8a2e6b298158c5f998"}
         io.github.kotoba-lang/merkle-lsm
         {:git/sha "202c365c86b6ac0d5e9a3329f6f05d5a076878b5"}
+        io.github.kotoba-lang/prolly-tree
+        {:git/sha "7906ae8dd17ce349bd5696532df7ebaa1e2f1498"}
         io.github.kotoba-lang/kotobase-storage
         {:git/sha "f41e7bd3dfc8547614c6adc843c9d5fd1290687f"}
         ;; Reader half of ADR-2608060500. `decode-node` is the identity on

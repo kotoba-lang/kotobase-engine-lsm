@@ -24,7 +24,30 @@
                      (throw (ex-info "block is not in the synchronous cache"
                                      {:type :kotobase.engine/missing-block
                                       :missing-cid cid}))))
-        eng (lsm/lsm-engine (merge options {:put! put! :get-fn get-fn}))]
+        commit-get-fn
+        (fn [cid]
+          (if-some [bytes (get @cache cid)]
+            (js/Promise.resolve bytes)
+            (do
+              (swap! requests inc)
+              (-> (storage/-get-blocks backend [cid])
+                  (.then
+                   (fn [blocks]
+                     (if-some [bytes (get blocks cid)]
+                       (let [actual (ipld/cid bytes)]
+                         (when-not (= cid actual)
+                           (throw (ex-info "content-addressed block CID mismatch"
+                                           {:type :ipld/cid-mismatch
+                                            :expected-cid cid
+                                            :actual-cid actual})))
+                         (swap! cache assoc cid bytes)
+                         bytes)
+                       (throw (ex-info "content-addressed block was not found"
+                                       {:type :kotobase.engine/block-not-found
+                                        :cid cid})))))))))
+        eng (lsm/lsm-engine
+             (merge options {:put! put! :get-fn get-fn
+                             :commit-get-fn commit-get-fn}))]
     (with-meta eng
       {:kotobase.provider/runtime
        {:backend backend :cache cache :pending pending :requests requests}})))
@@ -101,9 +124,13 @@
                           node (bcn/decode-node (get @cache cid))
                           lsm-cid (ipld/link-cid (get node "lsm-manifest"))
                           metadata-head (some-> (get node "metadata-head")
-                                                ipld/link-cid)]
+                                                ipld/link-cid)
+                          format-version (get node "format-version")]
                       (-> (fetch-cids! eng [lsm-cid])
-                          (.then (fn [_] (prefetch-metadata! eng metadata-head)))
+                          (.then (fn [_]
+                                   (if (= 2 format-version)
+                                     (prefetch-metadata! eng metadata-head)
+                                     nil)))
                           (.then (fn [_]
                                    (engine/restore-state eng cid
                                                          {:lazy? true}))))))))))))))

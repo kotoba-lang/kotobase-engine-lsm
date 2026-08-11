@@ -2,6 +2,7 @@
   "Datomic-shaped engine over immutable Merkle-LSM runs."
   (:require [clojure.edn :as edn]
             [ipld.core :as ipld]
+            [ipld.value :as value]
             [kotobase.blockcodec.node :as bcn]
             [kotobase.engine.canonical :as canonical]
             [kotobase.engine.completion :as completion]
@@ -9,15 +10,18 @@
             [kotobase.engine.metadata :as metadata]
             [kotobase.engine.profile :as profile]
             [merkle-lsm.compaction :as compaction]
-            [merkle-lsm.core :as lsm]))
+            [merkle-lsm.core :as lsm]
+            [prolly-tree.core :as tree]))
 
-(def engine-format-version 2)
+(def engine-format-version 3)
+(def metadata-index-format "kotobase.engine-metadata-index/v1")
 
 (def lsm-profile
   (-> profile/merkle-lsm
       (assoc :engine/implementation :kotobase.engine/lsm)
       (update :engine/capabilities conj :typed-edn :durable-manifest
-              :append-only-runs :physical-maintenance)))
+              :append-only-runs :physical-maintenance
+              :persistent-metadata-index :lazy-history)))
 
 (defn- digest [engine canonical-string]
   ((:digest-fn engine) canonical-string))
@@ -76,7 +80,8 @@
    {:runs {} :work-units 0}
    runs))
 
-(defn- manifest-node [state lsm-root metadata-head transaction-root]
+(defn- manifest-node [state lsm-root metadata-root current-request-key
+                      transaction-root]
   (cond->
    {"engine" "kotobase-engine-lsm"
     "format-version" engine-format-version
@@ -84,13 +89,178 @@
     "basis-t" (:basis-t state)
     "safe-epoch" (:safe-epoch state 0)
     "lsm-manifest" (ipld/link lsm-root)
-    "metadata-head" (some-> metadata-head ipld/link)
+    "metadata-format" metadata-index-format
+    "metadata-root" (some-> metadata-root ipld/link)
+    "current-request-key" current-request-key
     "previous-manifest" (some-> (:physical-root state) ipld/link)}
     transaction-root
     (assoc "transaction-manifest" (ipld/link transaction-root))))
 
 (defn- read-field [node key]
   (edn/read-string (get node key)))
+
+(defn- epoch-key [epoch]
+  (let [digits (str epoch)]
+    (str "e/" (apply str (repeat (max 0 (- 20 (count digits))) "0")) digits)))
+
+(defn- history-key [epoch]
+  (str "h/" (subs (epoch-key epoch) 2)))
+
+(defn- request-key [metadata-key-fn request-id]
+  (completion/then-result
+   (metadata-key-fn
+    (canonical/canonical-string ["kotobase.request-id/v1" request-id]))
+   (fn [token]
+     (when-not (contract/nonblank-string? token)
+       (throw (ex-info "metadata-key-fn returned an invalid token"
+                       {:type :kotobase.engine/invalid-metadata-key})))
+     (str "r/" token))))
+
+(defn- storage-envelope->tree-bytes [bytes]
+  (if (bcn/envelope? (ipld/decode bytes))
+    (ipld/encode (bcn/decode-node bytes))
+    bytes))
+
+#_{:clj-kondo/ignore [:unused-private-var]}
+(defn- tree-get [get-fn cid]
+  (some-> (get-fn cid) storage-envelope->tree-bytes))
+
+#_{:clj-kondo/ignore [:unused-private-var]}
+(defn- tree-get-completion [get-fn cid]
+  (completion/then-result (get-fn cid) storage-envelope->tree-bytes))
+
+(defn- index-lookup [get-fn root key]
+  #?(:clj (tree/lookup #(tree-get get-fn %) root key)
+     :cljs (-> (tree/scan-prefix-async
+                #(tree-get-completion get-fn %) root key)
+               (.then (fn [entries]
+                        (some (fn [[entry-key entry-value]]
+                                (when (= key entry-key) entry-value))
+                              entries))))))
+
+(defn- index-insert-many [put! get-fn root pairs]
+  #?(:clj (tree/insert-many put! #(tree-get get-fn %) root pairs)
+     :cljs (tree/insert-many-async put! #(tree-get-completion get-fn %)
+                                   root pairs)))
+
+(defn- seal-entry [encrypt-fn entry]
+  (completion/then-result (encrypt-fn (value/encode-value entry)) identity))
+
+(defn- open-entry [decrypt-fn ciphertext]
+  (when ciphertext
+    (completion/then-result (decrypt-fn ciphertext) value/decode-value)))
+
+(defn- indexed-request [get-fn decrypt-fn metadata-key-fn state request-id]
+  (completion/then-result
+   (request-key metadata-key-fn request-id)
+   (fn [key]
+     (completion/then-result
+      (index-lookup get-fn (:metadata-root state) key)
+      (fn [ciphertext]
+        (completion/then-result
+         (open-entry decrypt-fn ciphertext)
+         (fn [record]
+           (when record
+             (cond-> record
+               (and (= key (:current-request-key state))
+                    (nil? (:physical-root record)))
+               (assoc :physical-root (:current-transaction-root state)))))))))))
+
+(defn- indexed-request-by-key [get-fn decrypt-fn metadata-root key]
+  (completion/then-result
+   (index-lookup get-fn metadata-root key)
+   #(open-entry decrypt-fn %)))
+
+(defn- indexed-epoch [get-fn metadata-root epoch]
+  (index-lookup get-fn metadata-root (epoch-key epoch)))
+
+(defn- indexed-history [get-fn decrypt-fn metadata-root]
+  (let [entries #?(:clj (tree/scan-prefix #(tree-get get-fn %)
+                                           metadata-root "h/")
+                   :cljs (tree/scan-prefix-async
+                          #(tree-get-completion get-fn %) metadata-root "h/"))]
+    (completion/then-result
+     entries
+     (fn [pairs]
+       (reduce
+        (fn [result [_ ciphertext]]
+          (completion/then-result
+           result
+           (fn [rows]
+             (completion/then-result
+              (open-entry decrypt-fn ciphertext)
+              #(into rows %)))))
+        [] pairs)))))
+
+(defn- encrypted-pair [encrypt-fn key entry]
+  (completion/then-result (seal-entry encrypt-fn entry) #(vector key %)))
+
+(defn- append-completion [result completion]
+  (completion/then-result
+   result
+   (fn [values]
+     (completion/then-result completion #(conj values %)))))
+
+(defn- migration-index-pairs
+  [encrypt-fn metadata-key-fn state]
+  (let [history-pairs
+        (reduce-kv
+         (fn [result epoch rows]
+           (append-completion result
+                              (encrypted-pair encrypt-fn (history-key epoch)
+                                              rows)))
+         [] (group-by :t (or (:history state) [])))
+        request-pairs
+        (reduce
+         (fn [result request]
+           (append-completion
+            result
+            (completion/then-result
+             (request-key metadata-key-fn (:request-id request))
+             #(encrypted-pair encrypt-fn % request))))
+         history-pairs (vals (:requests state)))
+        epoch-pairs
+        (mapv (fn [[epoch root]]
+                [(epoch-key epoch) {"physical-root" root}])
+              (:snapshots state))]
+    (completion/then-result request-pairs #(into % epoch-pairs))))
+
+(defn- commit-index!
+  [put! get-fn encrypt-fn metadata-key-fn state epoch appended request]
+  (completion/then-result
+   (request-key metadata-key-fn (:request-id request))
+   (fn [current-key]
+     (let [base-pairs (if (:metadata-root state)
+                        []
+                        (migration-index-pairs encrypt-fn metadata-key-fn
+                                               state))
+           current-pair (encrypted-pair encrypt-fn current-key request)
+           history-pair (encrypted-pair encrypt-fn (history-key epoch)
+                                        appended)
+           previous-pair
+           (when (and (:current-request-key state)
+                      (:current-request state))
+             (encrypted-pair encrypt-fn (:current-request-key state)
+                             (:current-request state)))
+           epoch-pair
+           (when (pos? (:basis-t state))
+             [(epoch-key (:basis-t state))
+              {"physical-root" (:physical-root state)
+               "transaction-root" (:current-transaction-root state)}])]
+       (completion/then-result
+        base-pairs
+        (fn [pairs]
+          (completion/then-result
+           (append-completion (append-completion pairs current-pair)
+                              history-pair)
+           (fn [pairs]
+             (completion/then-result
+              (if previous-pair (append-completion pairs previous-pair) pairs)
+              (fn [pairs]
+                (let [pairs (cond-> pairs epoch-pair (conj epoch-pair))]
+                  (completion/then-result
+                   (index-insert-many put! get-fn (:metadata-root state) pairs)
+                   (fn [root] {:root root :current-key current-key})))))))))))))
 
 (defn- restored-metadata [segments physical-root transaction-root]
   (let [deltas (mapv :delta segments)
@@ -207,20 +377,22 @@
                        :pins pins})))
     (max current candidate)))
 
-(defrecord MerkleLsmEngine [put! get-fn digest-fn encrypt-fn decrypt-fn
-                            target-run-rows l0-compaction-threshold
-                            reader-pins-fn]
+(defrecord MerkleLsmEngine [put! get-fn commit-get-fn digest-fn encrypt-fn
+                            decrypt-fn metadata-key-fn target-run-rows
+                            l0-compaction-threshold reader-pins-fn]
   contract/IEngine
   (-engine-profile [_] lsm-profile)
   (-empty-state [_ {:keys [database-id]}]
     {:database-id database-id :basis-t 0 :safe-epoch 0
      :runs {} :run-refs {} :history []
-     :requests {} :snapshots {} :metadata-head nil})
+     :requests {} :snapshots {} :metadata-head nil :metadata-root nil
+     :current-request-key nil :current-request nil
+     :current-transaction-root nil})
 
   (-restore-state [_ physical-root opts]
     (let [node (bcn/decode-node (get-fn physical-root))
           _ (when-not (and (= "kotobase-engine-lsm" (get node "engine"))
-                           (contains? #{1 engine-format-version}
+                           (contains? #{1 2 engine-format-version}
                                       (get node "format-version")))
               (throw (ex-info "unsupported LSM engine manifest"
                               {:type :kotobase.engine/unsupported-manifest})))
@@ -228,26 +400,26 @@
           lsm-root (ipld/link-cid (get node "lsm-manifest"))
           lsm-manifest (bcn/decode-node (get-fn lsm-root))
           refs-by-index (manifest-run-refs lsm-manifest)
-          finish (fn [{:keys [history requests snapshots metadata-head]}]
-                   {:database-id (get node "database-id") :basis-t basis-t
-                    :safe-epoch (get node "safe-epoch" 0)
-                    :runs (when-not (:lazy? opts)
-                            (load-run-refs get-fn refs-by-index))
-                    :run-refs refs-by-index :lsm-root lsm-root
-                    :history history :requests requests :snapshots snapshots
-                    :metadata-head metadata-head
-                    :physical-root physical-root})]
-      (if (= 1 (get node "format-version"))
+          base {:database-id (get node "database-id") :basis-t basis-t
+                :safe-epoch (get node "safe-epoch" 0)
+                :runs (when-not (:lazy? opts)
+                        (load-run-refs get-fn refs-by-index))
+                :run-refs refs-by-index :lsm-root lsm-root
+                :physical-root physical-root}]
+      (case (get node "format-version")
+        1
         (let [current (read-field node "current-request-edn")
               requests (cond-> (read-field node "requests-edn")
                          current (assoc (:request-id current)
                                         (assoc current
                                                :physical-root physical-root)))]
-          (finish {:history (read-field node "history-edn")
-                   :requests requests
-                   :snapshots (assoc (read-field node "snapshots-edn")
-                                     basis-t physical-root)
-                   :metadata-head nil}))
+          (merge base
+                 {:history (read-field node "history-edn")
+                  :requests requests
+                  :snapshots (assoc (read-field node "snapshots-edn")
+                                    basis-t physical-root)
+                  :metadata-head nil :metadata-root nil}))
+        2
         (let [metadata-head (some-> (get node "metadata-head") ipld/link-cid)
               transaction-root (some-> (get node "transaction-manifest")
                                        ipld/link-cid)]
@@ -255,9 +427,36 @@
            (metadata/restore-chain get-fn decrypt-fn bcn/decode-node
                                    metadata-head)
            (fn [segments]
-             (finish (assoc (restored-metadata segments physical-root
-                                                transaction-root)
-                            :metadata-head metadata-head))))))))
+             (merge base
+                    (restored-metadata segments physical-root transaction-root)
+                    {:metadata-head metadata-head :metadata-root nil}))))
+        3
+        (let [metadata-root (some-> (get node "metadata-root") ipld/link-cid)
+              current-key (get node "current-request-key")
+              _ (when-not (= metadata-index-format
+                             (get node "metadata-format"))
+                  (throw (ex-info "unsupported LSM metadata index"
+                                  {:type :kotobase.engine/unsupported-metadata-index
+                                   :format (get node "metadata-format")})))
+              transaction-root (or (some-> (get node "transaction-manifest")
+                                           ipld/link-cid)
+                                   physical-root)]
+          (completion/then-result
+           (indexed-request-by-key commit-get-fn decrypt-fn metadata-root
+                                   current-key)
+           (fn [current]
+             (let [current (some-> current
+                                   (assoc :physical-root transaction-root))]
+               (merge base
+                      {:history nil
+                       :requests (if current
+                                   {(:request-id current) current}
+                                   {})
+                       :snapshots {basis-t physical-root}
+                       :metadata-head nil :metadata-root metadata-root
+                       :current-request-key current-key
+                       :current-request current
+                       :current-transaction-root transaction-root}))))))))
 
   (-transact [this state {:keys [database-id request-id tx-data]}]
     (when-not (= database-id (:database-id state))
@@ -265,78 +464,81 @@
                       {:type :kotobase.engine/database-mismatch})))
     (let [tx (canonical/normalize-tx tx-data)
           tx-root (digest this (canonical/transaction-string tx))]
-      (if-let [prior (get-in state [:requests request-id])]
-        (if (= tx-root (:tx-root prior))
-          {:state state
-           :receipt {:database-id database-id :epoch (:epoch prior)
-                     :request-id request-id :tx-root tx-root
-                     :physical-root (:physical-root prior) :engine lsm-profile
-                     :status :replayed}}
-          (throw (ex-info "request-id was already used for another transaction"
-                          {:type :kotobase.engine/idempotency-conflict})))
-        (let [epoch (inc (:basis-t state))
-              safe-epoch (next-safe-epoch reader-pins-fn state epoch)
-              current-runs (or (:runs state)
-                               (load-run-refs get-fn (:run-refs state)))
-              new-runs (lsm/build-index-run-ranges
-                        database-id epoch target-run-rows
-                        (mapv encode-datom tx))
-              _ (doseq [runs (vals new-runs) run runs]
-                  (persist-effects! put! (:effects run)))
-              all-runs (compact-runs-if-needed
-                        put! database-id safe-epoch target-run-rows
-                        l0-compaction-threshold
-                        (merge-with into current-runs new-runs))
-              lsm-manifest (lsm/build-manifest
-                            {:db-id database-id :epoch epoch
-                             :safe-epoch safe-epoch
-                             :previous (:lsm-root state)
-                             :indexes (run-refs all-runs)})
-              _ (persist-effects! put! (:effects lsm-manifest))
-              lsm-root (:cid lsm-manifest)
-              appended (mapv (fn [{:keys [e a v op]}]
-                               {:e e :a a :v v :t epoch
-                                :added (= :assert op)}) tx)
-              next-state (-> state (assoc :basis-t epoch
-                                          :safe-epoch safe-epoch
-                                          :runs all-runs
-                                          :run-refs
-                                          (into {}
-                                                (map (fn [[index values]]
-                                                       [index (mapv run-ref-of
-                                                                    values)]))
-                                                all-runs)
-                                          :lsm-root lsm-root)
-                             (update :history into appended))
-              current {:request-id request-id :tx-root tx-root}
-              previous-transaction-root
-              (->> (:requests state)
-                   vals
-                   (filter #(= (:basis-t state) (:epoch %)))
-                   first
-                   :physical-root)]
-          (completion/then-result
-           (metadata/persist-segment!
-            put! encrypt-fn (:metadata-head state)
-            {:epoch epoch :history appended :request current
-             :previous-physical-root (:physical-root state)
-             :previous-transaction-root previous-transaction-root})
-           (fn [metadata-head]
-             (let [physical-root
-                   (ipld/put-node!
-                    put! (manifest-node next-state lsm-root metadata-head nil))
-                   record (assoc current :epoch epoch
-                                 :physical-root physical-root)
-                   final-state (-> next-state
-                                   (assoc :metadata-head metadata-head
-                                          :physical-root physical-root)
-                                   (assoc-in [:snapshots epoch] physical-root)
-                                   (assoc-in [:requests request-id] record))]
-               {:state final-state
-                :receipt {:database-id database-id :epoch epoch
-                          :request-id request-id :tx-root tx-root
-                          :physical-root physical-root :engine lsm-profile
-                          :status :committed}})))))))
+      (completion/then-result
+       (or (get-in state [:requests request-id])
+           (when (:metadata-root state)
+             (indexed-request commit-get-fn decrypt-fn metadata-key-fn
+                              state request-id)))
+       (fn [prior]
+         (if prior
+           (if (= tx-root (:tx-root prior))
+             {:state state
+              :receipt {:database-id database-id :epoch (:epoch prior)
+                        :request-id request-id :tx-root tx-root
+                        :physical-root (:physical-root prior)
+                        :engine lsm-profile :status :replayed}}
+             (throw
+              (ex-info "request-id was already used for another transaction"
+                       {:type :kotobase.engine/idempotency-conflict})))
+           (let [epoch (inc (:basis-t state))
+                 safe-epoch (next-safe-epoch reader-pins-fn state epoch)
+                 current-runs (or (:runs state)
+                                  (load-run-refs get-fn (:run-refs state)))
+                 new-runs (lsm/build-index-run-ranges
+                           database-id epoch target-run-rows
+                           (mapv encode-datom tx))
+                 _ (doseq [runs (vals new-runs) run runs]
+                     (persist-effects! put! (:effects run)))
+                 all-runs (compact-runs-if-needed
+                           put! database-id safe-epoch target-run-rows
+                           l0-compaction-threshold
+                           (merge-with into current-runs new-runs))
+                 lsm-manifest (lsm/build-manifest
+                               {:db-id database-id :epoch epoch
+                                :safe-epoch safe-epoch
+                                :previous (:lsm-root state)
+                                :indexes (run-refs all-runs)})
+                 _ (persist-effects! put! (:effects lsm-manifest))
+                 lsm-root (:cid lsm-manifest)
+                 appended (mapv (fn [{:keys [e a v op]}]
+                                  {:e e :a a :v v :t epoch
+                                   :added (= :assert op)}) tx)
+                 next-state (-> state
+                                (assoc :basis-t epoch :safe-epoch safe-epoch
+                                       :runs all-runs
+                                       :run-refs
+                                       (into {}
+                                             (map (fn [[index values]]
+                                                    [index (mapv run-ref-of
+                                                                 values)]))
+                                             all-runs)
+                                       :lsm-root lsm-root)
+                                (update :history (fnil into []) appended))
+                 current {:request-id request-id :tx-root tx-root
+                          :epoch epoch}]
+             (completion/then-result
+              (commit-index! put! commit-get-fn encrypt-fn metadata-key-fn
+                             state epoch appended current)
+              (fn [{:keys [root current-key]}]
+                (let [physical-root
+                      (ipld/put-node!
+                       put! (manifest-node next-state lsm-root root current-key
+                                           nil))
+                      record (assoc current :physical-root physical-root)
+                      final-state
+                      (-> next-state
+                          (assoc :metadata-head nil :metadata-root root
+                                 :current-request-key current-key
+                                 :current-request record
+                                 :current-transaction-root physical-root
+                                 :physical-root physical-root
+                                 :snapshots {epoch physical-root}
+                                 :requests {request-id record}))]
+                  {:state final-state
+                   :receipt {:database-id database-id :epoch epoch
+                             :request-id request-id :tx-root tx-root
+                             :physical-root physical-root :engine lsm-profile
+                             :status :committed}})))))))))
 
   (-open-snapshot [_ state selector]
     (let [basis (:basis-t state)
@@ -346,22 +548,41 @@
         (throw (ex-info "snapshot :as-of is outside the database basis"
                         {:type :kotobase.engine/invalid-snapshot-selector
                          :safe-epoch safe-epoch :basis-t basis :as-of as-of})))
-      {:database-id (:database-id state) :basis-t as-of :runs (:runs state)
-       :run-refs (:run-refs state)
-       :history (:history state) :history? (true? (:history selector))
-       :physical-root (get-in state [:snapshots as-of])}))
+      (completion/then-result
+       (or (get-in state [:snapshots as-of])
+           (when (:metadata-root state)
+             (indexed-epoch commit-get-fn (:metadata-root state) as-of)))
+       (fn [root-or-entry]
+         {:database-id (:database-id state) :basis-t as-of
+          :runs (:runs state) :run-refs (:run-refs state)
+          :history (:history state) :metadata-root (:metadata-root state)
+          :history? (true? (:history selector))
+          :physical-root (if (map? root-or-entry)
+                           (get root-or-entry "physical-root")
+                           root-or-entry)}))))
 
-  (-scan [_ {:keys [runs run-refs basis-t history history?]} pattern _opts]
-    (->> (if history?
-           (->> history (filter #(<= (:t %) basis-t))
-                canonical/canonical-datoms)
-           (if runs
-             (logical-rows runs basis-t)
-             (lazy-logical-rows get-fn run-refs basis-t pattern)))
-         (filter #(matches? pattern %)) vec))
+  (-scan [_ {:keys [runs run-refs basis-t history history? metadata-root]}
+          pattern _opts]
+    (completion/then-result
+     (if (and history? (nil? history) metadata-root)
+       (indexed-history commit-get-fn decrypt-fn metadata-root)
+       history)
+     (fn [loaded-history]
+       (->> (if history?
+              (->> loaded-history (filter #(<= (:t %) basis-t))
+                   canonical/canonical-datoms)
+              (if runs
+                (logical-rows runs basis-t)
+                (lazy-logical-rows get-fn run-refs basis-t pattern)))
+            (filter #(matches? pattern %)) vec))))
 
-  (-history [_ {:keys [history basis-t]} _opts]
-    (->> history (filter #(<= (:t %) basis-t)) canonical/canonical-datoms))
+  (-history [_ {:keys [history basis-t metadata-root]} _opts]
+    (completion/then-result
+     (if (and (nil? history) metadata-root)
+       (indexed-history commit-get-fn decrypt-fn metadata-root)
+       history)
+     #(->> % (filter (fn [datom] (<= (:t datom) basis-t)))
+            canonical/canonical-datoms)))
 
   (-checkpoint [this {:keys [database-id basis-t runs run-refs physical-root]}
                 _opts]
@@ -399,14 +620,16 @@
               next-state (assoc state :runs runs :run-refs (run-refs runs)
                                 :lsm-root lsm-root)
               latest-transaction-root
-              (->> (:requests state)
-                   vals
-                   (filter #(= (:basis-t state) (:epoch %)))
-                   first
-                   :physical-root)
+              (or (:current-transaction-root state)
+                  (->> (:requests state)
+                       vals
+                       (filter #(= (:basis-t state) (:epoch %)))
+                       first
+                       :physical-root))
               physical-root (ipld/put-node!
                              put! (manifest-node next-state lsm-root
-                                                 (:metadata-head state)
+                                                 (:metadata-root state)
+                                                 (:current-request-key state)
                                                  latest-transaction-root))
               final-state (-> next-state
                               (assoc :physical-root physical-root)
@@ -419,14 +642,16 @@
                      :engine lsm-profile}})))))
 
 (defn lsm-engine
-  [{:keys [put! get-fn digest-fn encrypt-fn decrypt-fn target-run-rows
-           l0-compaction-threshold reader-pins-fn]
+  [{:keys [put! get-fn commit-get-fn digest-fn encrypt-fn decrypt-fn
+           metadata-key-fn target-run-rows l0-compaction-threshold
+           reader-pins-fn]
     :or {target-run-rows 4096 l0-compaction-threshold 8
          reader-pins-fn (constantly [])}}]
   (doseq [[capability value] [[:put! put!] [:get-fn get-fn]
                               [:digest-fn digest-fn]
                               [:encrypt-fn encrypt-fn]
-                              [:decrypt-fn decrypt-fn]]]
+                              [:decrypt-fn decrypt-fn]
+                              [:metadata-key-fn metadata-key-fn]]]
     (when-not (ifn? value)
       (throw (ex-info "LSM engine requires injected capability"
                       {:type :kotobase.engine/missing-capability
@@ -439,5 +664,6 @@
     (throw (ex-info "LSM engine reader-pins-fn must be callable"
                     {:type :kotobase.engine/missing-capability
                      :capability :reader-pins-fn})))
-  (->MerkleLsmEngine put! get-fn digest-fn encrypt-fn decrypt-fn
-                     target-run-rows l0-compaction-threshold reader-pins-fn))
+  (->MerkleLsmEngine put! get-fn (or commit-get-fn get-fn) digest-fn
+                     encrypt-fn decrypt-fn metadata-key-fn target-run-rows
+                     l0-compaction-threshold reader-pins-fn))

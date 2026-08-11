@@ -32,6 +32,8 @@
 
 (def options
   {:digest-fn #(str "digest:" (hash %))
+   :encrypt-fn #(js/Promise.resolve %)
+   :decrypt-fn #(js/Promise.resolve %)
    :target-run-rows 8
    :l0-compaction-threshold 1000})
 

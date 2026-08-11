@@ -73,6 +73,20 @@
 (defn- all-run-refs [state]
   (vec (mapcat val (:run-refs state))))
 
+(defn- prefetch-metadata! [eng head]
+  (letfn [(step [cid]
+            (if-not cid
+              (js/Promise.resolve nil)
+              (-> (fetch-cids! eng [cid])
+                  (.then
+                   (fn [_]
+                     (let [cache (:cache (runtime-of eng))
+                           node (bcn/decode-node (get @cache cid))
+                           previous (some-> (get node "previous")
+                                            ipld/link-cid)]
+                       (step previous)))))))]
+    (step head)))
+
 (defn restore-head [eng backend ref-name]
   (storage/validate-backend! backend)
   (-> (storage/-read-ref backend ref-name)
@@ -85,8 +99,11 @@
                   (fn [_]
                     (let [cache (:cache (runtime-of eng))
                           node (bcn/decode-node (get @cache cid))
-                          lsm-cid (ipld/link-cid (get node "lsm-manifest"))]
+                          lsm-cid (ipld/link-cid (get node "lsm-manifest"))
+                          metadata-head (some-> (get node "metadata-head")
+                                                ipld/link-cid)]
                       (-> (fetch-cids! eng [lsm-cid])
+                          (.then (fn [_] (prefetch-metadata! eng metadata-head)))
                           (.then (fn [_]
                                    (engine/restore-state eng cid
                                                          {:lazy? true}))))))))))))))

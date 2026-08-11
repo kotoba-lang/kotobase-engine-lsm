@@ -1,5 +1,6 @@
 (ns kotobase.engine.lsm-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [ipld.core :as ipld]
             [kotobase.engine.conformance :as conformance]
             [kotobase.engine.contract :as engine]
@@ -9,6 +10,9 @@
 
 (def digest-fn #(str "digest:" (hash %)))
 
+(defn- reverse-bytes [payload]
+  (byte-array (reverse (seq payload))))
+
 (defn fixture
   ([] (fixture {}))
   ([options]
@@ -17,7 +21,8 @@
      :engine (lsm/lsm-engine
               (merge {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
                       :get-fn #(get @blocks %)
-                      :digest-fn digest-fn}
+                      :digest-fn digest-fn
+                      :encrypt-fn identity :decrypt-fn identity}
                      options))})))
 
 (deftest shared-conformance
@@ -50,6 +55,37 @@
            (:logical-checkpoint-root
             (engine/checkpoint candidate
                                (engine/open-snapshot candidate restored)))))))
+
+(deftest manifest-v2-is-bounded-and-carries-no-plaintext-metadata
+  (let [{candidate :engine blocks :blocks}
+        (fixture {:encrypt-fn reverse-bytes :decrypt-fn reverse-bytes})
+        transact-one
+        (fn [state n]
+          (:state
+           (engine/transact
+            candidate state
+            {:database-id "lsm/bounded"
+             :request-id (str "private-request-" n)
+             :tx-data [[:db/add (str "entity-" n) :private/value
+                        (str "secret-value-" n)]]})))
+        s1 (transact-one (engine/empty-state candidate "lsm/bounded") 1)
+        s2 (transact-one s1 2)
+        s20 (reduce transact-one s2 (range 3 21))
+        root2-bytes (get @blocks (:physical-root s2))
+        root20-bytes (get @blocks (:physical-root s20))
+        root20 (bcn/decode-node root20-bytes)
+        metadata-node (bcn/decode-node (get @blocks (:metadata-head s20)))]
+    (is (= 2 (get root20 "format-version")))
+    (is (= #{"engine" "format-version" "database-id" "basis-t"
+             "safe-epoch" "lsm-manifest" "metadata-head"
+             "previous-manifest"}
+           (set (keys root20))))
+    (is (<= (count root20-bytes) (+ 16 (count root2-bytes)))
+        "root manifest size is independent of transaction history")
+    (is (= #{"format" "payload" "previous"} (set (keys metadata-node))))
+    (is (not-any? #(str/includes? (pr-str root20) %)
+                  ["private-request" "secret-value" "history-edn"
+                   "requests-edn" "snapshots-edn"]))))
 
 (deftest transaction-path-compacts-l0-without-losing-snapshots
   (let [candidate (:engine (fixture {:l0-compaction-threshold 2
@@ -97,14 +133,36 @@
                                  [nil nil nil])
         result (engine/maintain candidate before)
         after (:state result)
-        restored (engine/restore-state candidate (:physical-root after))]
+        restored (engine/restore-state candidate (:physical-root after))
+        replay (engine/transact
+                candidate restored
+                {:database-id database-id :request-id "m3"
+                 :tx-data [[:db/add "counter" :value 3]]})
+        next-state
+        (:state
+         (engine/transact candidate after
+                          {:database-id database-id :request-id "m4"
+                           :tx-data [[:db/add "counter" :value 4]]}))
+        restored-next (engine/restore-state candidate (:physical-root next-state))
+        replay-before-maintenance
+        (engine/transact
+         candidate restored-next
+         {:database-id database-id :request-id "m3"
+          :tx-data [[:db/add "counter" :value 3]]})]
     (is (= :completed (get-in result [:receipt :status])))
     (is (pos? (get-in result [:receipt :work-units])))
     (is (not= (:physical-root before) (:physical-root after)))
     (is (= (:basis-t before) (:basis-t after)) "maintenance is not a transaction")
     (is (= before-rows
            (engine/scan candidate (engine/open-snapshot candidate restored)
-                        [nil nil nil])))))
+                        [nil nil nil])))
+    (is (= :replayed (get-in replay [:receipt :status])))
+    (is (= (get-in before [:requests "m3" :physical-root])
+           (get-in replay [:receipt :physical-root]))
+        "maintenance never rewrites a transaction receipt identity")
+    (is (= (get-in before [:requests "m3" :physical-root])
+           (get-in replay-before-maintenance [:receipt :physical-root]))
+        "a later transaction still preserves the pre-maintenance receipt")))
 
 (deftest reader-pins-advance-and-persist-safe-epoch
   (let [pins (atom [])
@@ -160,6 +218,7 @@
                 {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
                  :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
                  :digest-fn digest-fn
+                 :encrypt-fn identity :decrypt-fn identity
                  :target-run-rows 8
                  :l0-compaction-threshold 1000})
         restored (engine/restore-state reader (:physical-root seeded)
@@ -176,7 +235,8 @@
                      :tx-data [[:db/retract "entity-50" :value 50]
                                [:db/add "entity-101" :value 101]]}))]
     (is (nil? (:runs restored)) "restore retains run refs, not decoded runs")
-    (is (= 2 restore-gets) "restore reads only engine and LSM manifests")
+    (is (= 3 restore-gets)
+        "restore reads engine, LSM, and one sealed metadata segment")
     (is (= [50] (mapv :v rows)))
     (is (<= point-gets 3) "the entity range selects a bounded run subset")
     (is (< point-gets eavt-runs)

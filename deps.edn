@@ -5,11 +5,11 @@
         ;; portability boundary explicit instead of inheriting an arbitrary
         ;; transitive revision from an index implementation.
         io.github.kotoba-lang/io-ipld
-        {:git/sha "309db3f8a7d690ccd07abc69b1a37793955c6105"}
+        {:git/sha "48ba40490cf082a1473986ac757b8e2b214a3d1b"}
         io.github.kotoba-lang/merkle-lsm
-        {:git/sha "202c365c86b6ac0d5e9a3329f6f05d5a076878b5"}
+        {:git/sha "401b79985ca081b497c3cc3ddfb241c4f0ab04fe"}
         io.github.kotoba-lang/prolly-tree
-        {:git/sha "7906ae8dd17ce349bd5696532df7ebaa1e2f1498"}
+        {:git/sha "3a12dd2b77430007031e408ee8db75d35f1757a1"}
         io.github.kotoba-lang/kotobase-storage
         {:git/sha "fce6991cd1f0ff028b234317f2fdb2cfbd7b56ac"}
         ;; Reader half of ADR-2608060500. `decode-node` is the identity on
@@ -17,7 +17,7 @@
         ;; it makes this engine able to read a compressed run block, which
         ;; has to be true everywhere BEFORE merkle-lsm starts writing them.
         io.github.kotoba-lang/kotobase-block-codec
-        {:git/sha "f03bcef355975067060af55e23e9c8bbfb0bc362"}}
+        {:git/sha "3ec88f11e7b35efd7f592f52c511a067d50bf096"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

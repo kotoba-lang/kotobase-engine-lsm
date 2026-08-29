@@ -5,7 +5,6 @@
     "test:cljs": "nbb --classpath \"$(clojure -Spath)\" test/run.cljs"
   },
   "dependencies": {
-    "@noble/hashes": "^1.4.0",
     "nbb": "^1.4.208"
   }
 }

@@ -1,5 +1,10 @@
 {:paths ["src"]
- :deps {io.github.kotoba-lang/kotobase-engine-contract
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       io.github.kotoba-lang/kotobase-engine-contract
         {:git/sha "7aced98bbe1a3faa8324c8e9161a83db767068e4"}
         ;; This engine requires ipld.core/value directly. Keep the runtime
         ;; portability boundary explicit instead of inheriting an arbitrary

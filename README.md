@@ -35,7 +35,7 @@ regression keeps both cold restore and replay of the oldest request below ten
 block reads; a full history query deliberately pays for a prefix scan.
 
 ```sh
-clojure -M:test
-clojure -M:lint
+kbb -M:test
+kbb -M:lint
 npm run test:cljs
 ```

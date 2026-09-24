@@ -1,6 +1,6 @@
 (ns kotobase.engine.lsm-test
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is]]
+            [kotoba.test :refer [deftest is]]
             [ipld.core :as ipld]
             [kotobase.engine.conformance :as conformance]
             [kotobase.engine.contract :as engine]

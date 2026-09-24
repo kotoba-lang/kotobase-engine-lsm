@@ -1,6 +1,6 @@
 (ns kotobase.engine.lsm
   "Datomic-shaped engine over immutable Merkle-LSM runs."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [ipld.core :as ipld]
             [ipld.value :as value]
             [kotobase.blockcodec.node :as bcn]
